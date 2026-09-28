@@ -85,4 +85,5 @@ just ci
 ## Docs
 
 - Design: ./docs/design
+- Task-card / chat-flow implementation: start with [cloud handoff](docs/design/chat-flow-handoff.md), then its requirements, approved technical design, and decision context. Historical research options are not pending product decisions.
 - `docs/config-schema.json` 由代码生成，勿手改：改了 Config 结构后跑 `cargo run -p cli -- config schema > docs/config-schema.json`（drift 测试兜底）
