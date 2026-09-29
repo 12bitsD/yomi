@@ -8,7 +8,7 @@ use sqlx::sqlite::SqlitePool;
 use tracing::{info, warn};
 
 /// Current schema version - bump this when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 26;
 
 /// A single database migration (can contain multiple SQL statements)
 struct Migration {
@@ -318,6 +318,37 @@ const MIGRATIONS: &[Migration] = &[
         // 旋钮一列。更新走 json_set/json_remove 原子按键写。
         name: "add_session_settings",
         sqls: &[r"ALTER TABLE sessions ADD COLUMN settings TEXT;"],
+    },
+    Migration {
+        version: 26,
+        // chat-flow W1 执行任务登记（exec registry，设计依据
+        // docs/design/chat-flow-technical-design.md N1/N2/C2）：任务
+        // 身份 + Provider 绑定三态机持久化。dedup 唯一索引保证同一
+        // 创建意图重送收敛到同一任务（create 走 ON CONFLICT DO
+        // NOTHING，不改既有行）。
+        name: "add_exec_tasks",
+        sqls: &[
+            r"CREATE TABLE exec_tasks (
+                id TEXT PRIMARY KEY,
+                channel_name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                binding TEXT NOT NULL DEFAULT 'uninitialized',
+                provider_session_id TEXT,
+                thread_root_msg_id TEXT,
+                card_msg_id TEXT,
+                card_generation INTEGER NOT NULL DEFAULT 0,
+                goal TEXT NOT NULL,
+                working_dir TEXT,
+                created_by TEXT NOT NULL,
+                source TEXT NOT NULL,
+                dedup_key TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+            r"CREATE UNIQUE INDEX idx_exec_tasks_dedup ON exec_tasks(channel_name, dedup_key);",
+            r"CREATE INDEX idx_exec_tasks_thread ON exec_tasks(thread_root_msg_id);",
+        ],
     },
 ];
 

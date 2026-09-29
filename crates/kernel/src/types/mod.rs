@@ -107,6 +107,7 @@ define_id!(CronJobId => "cron_");
 define_id!(EventId => "evt_");
 define_id!(MailboxItemId => "mbx_");
 define_id!(BtwId => "btw_");
+define_id!(ExecTaskId => "task_");
 
 // ─── Specialised extensions ─────────────────────────────────────────────
 

@@ -90,6 +90,9 @@ pub struct Kernel {
     /// Disposable persistent KV cache (`cache.db`), shared with channel adapters.
     pub(crate) kv_cache: Option<Arc<crate::kv_cache::KvCache>>,
     pub(crate) channel_manager: Option<Arc<crate::channels::hub::ChannelHub>>,
+    /// Exec task registry (chat-flow W1)：执行任务登记/绑定状态机
+    /// 持久化。取自 `StorageSet`，不经 `Kernel::new` 参数。
+    exec_task_store: Arc<dyn crate::exec::ExecTaskStore>,
     /// `ext_route` 的内存回退路由表（无 channel store 时）：(source, key)
     /// → session。纯内存，daemon 重启后首个 emit 重建映射。
     ext_routes: dashmap::DashMap<(String, String), SessionId>,
@@ -141,6 +144,11 @@ impl Kernel {
     /// Get the channel manager (if channels are configured).
     pub fn channel_manager(&self) -> Option<Arc<crate::channels::hub::ChannelHub>> {
         self.channel_manager.clone()
+    }
+
+    /// Get the exec task registry store (chat-flow W1).
+    pub fn exec_task_store(&self) -> Arc<dyn crate::exec::ExecTaskStore> {
+        self.exec_task_store.clone()
     }
 
     /// Get pinned session store
@@ -570,6 +578,7 @@ impl Kernel {
             restart_tx: Arc::new(std::sync::Mutex::new(None)),
             kv_cache: storage.kv_cache(),
             channel_manager,
+            exec_task_store: storage.exec_task_store(),
             ext_routes: dashmap::DashMap::new(),
             notification_bus,
             shutdown,

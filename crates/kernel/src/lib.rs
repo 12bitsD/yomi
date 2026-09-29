@@ -25,6 +25,7 @@ pub mod compactor;
 pub mod config;
 pub mod cron;
 pub mod event;
+pub mod exec;
 pub mod hook;
 pub mod kernel;
 pub mod kv_cache;
