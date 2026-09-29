@@ -37,6 +37,8 @@ struct ExecTaskDbRow {
     thread_root_msg_id: Option<String>,
     card_msg_id: Option<String>,
     card_generation: i64,
+    card_sent_at: Option<DateTime<Utc>>,
+    card_entity_created_at: Option<DateTime<Utc>>,
     goal: String,
     working_dir: Option<String>,
     created_by: String,
@@ -60,6 +62,8 @@ impl ExecTaskDbRow {
             thread_root_msg_id: self.thread_root_msg_id,
             card_msg_id: self.card_msg_id,
             card_generation: self.card_generation,
+            card_sent_at: self.card_sent_at,
+            card_entity_created_at: self.card_entity_created_at,
             goal: self.goal,
             working_dir: self.working_dir,
             created_by: self.created_by,
@@ -85,6 +89,9 @@ impl ExecTaskStore for SqliteExecTaskStore {
             thread_root_msg_id: None,
             card_msg_id: None,
             card_generation: 0,
+            // 尚无卡：期限事实列随发卡/换代回填（增量 8）。
+            card_sent_at: None,
+            card_entity_created_at: None,
             goal: input.goal.clone(),
             working_dir: input.working_dir.clone(),
             created_by: input.created_by.clone(),
@@ -136,6 +143,7 @@ impl ExecTaskStore for SqliteExecTaskStore {
         let row = sqlx::query_as::<_, ExecTaskDbRow>(
             r"SELECT id, channel_name, provider, status, binding,
                      provider_session_id, thread_root_msg_id, card_msg_id, card_generation,
+                     card_sent_at, card_entity_created_at,
                      goal, working_dir, created_by, source, dedup_key, created_at, updated_at
               FROM exec_tasks WHERE id = ?",
         )
@@ -151,6 +159,7 @@ impl ExecTaskStore for SqliteExecTaskStore {
         let row = sqlx::query_as::<_, ExecTaskDbRow>(
             r"SELECT id, channel_name, provider, status, binding,
                      provider_session_id, thread_root_msg_id, card_msg_id, card_generation,
+                     card_sent_at, card_entity_created_at,
                      goal, working_dir, created_by, source, dedup_key, created_at, updated_at
               FROM exec_tasks WHERE channel_name = ? AND dedup_key = ?",
         )
@@ -171,6 +180,7 @@ impl ExecTaskStore for SqliteExecTaskStore {
         let row = sqlx::query_as::<_, ExecTaskDbRow>(
             r"SELECT id, channel_name, provider, status, binding,
                      provider_session_id, thread_root_msg_id, card_msg_id, card_generation,
+                     card_sent_at, card_entity_created_at,
                      goal, working_dir, created_by, source, dedup_key, created_at, updated_at
               FROM exec_tasks WHERE channel_name = ? AND thread_root_msg_id = ?",
         )
@@ -268,18 +278,53 @@ impl ExecTaskStore for SqliteExecTaskStore {
         thread_root_msg_id: &str,
         card_msg_id: &str,
     ) -> Result<ExecTask> {
+        // 发卡时刻同写（增量 8，§8-L1 期限判据——发卡即本调用）。
         let updated = sqlx::query(
             r"UPDATE exec_tasks
-               SET thread_root_msg_id = ?, card_msg_id = ?, updated_at = ?
+               SET thread_root_msg_id = ?, card_msg_id = ?, card_sent_at = ?, updated_at = ?
                WHERE id = ?",
         )
         .bind(thread_root_msg_id)
         .bind(card_msg_id)
         .bind(Utc::now())
+        .bind(Utc::now())
         .bind(id.as_str())
         .execute(&self.pool)
         .await
         .map_err(|e| storage_err(format!("Failed to set exec task thread/card: {e}")))?
+        .rows_affected();
+        if updated == 0 {
+            return Err(KernelError::task(format!("exec task {id} not found")));
+        }
+        self.get_required(id).await
+    }
+
+    async fn bump_card_generation(
+        &self,
+        id: &ExecTaskId,
+        thread_root_msg_id: &str,
+        card_msg_id: &str,
+        sent_at: DateTime<Utc>,
+    ) -> Result<ExecTask> {
+        // 代次原子 +1（并发换代由调用方的 per-task 串行锁杜绝；
+        // 这里不在 WHERE 带旧代次——锁内重读后旧代已知，切换是
+        // 单写者语义）。只换呈现映射：binding/status 等执行身份
+        // 列一律不动（D12）。
+        let updated = sqlx::query(
+            r"UPDATE exec_tasks
+               SET thread_root_msg_id = ?, card_msg_id = ?,
+                   card_generation = card_generation + 1,
+                   card_sent_at = ?, updated_at = ?
+               WHERE id = ?",
+        )
+        .bind(thread_root_msg_id)
+        .bind(card_msg_id)
+        .bind(sent_at)
+        .bind(Utc::now())
+        .bind(id.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| storage_err(format!("Failed to bump exec task card generation: {e}")))?
         .rows_affected();
         if updated == 0 {
             return Err(KernelError::task(format!("exec task {id} not found")));

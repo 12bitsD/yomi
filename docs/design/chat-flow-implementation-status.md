@@ -103,7 +103,18 @@
 - **已知待硬化（P7）**：分流臂 受理→凭据写入→派发 之间存在微窗口——同任务终态竞态恰落窗口时，跨重启重送项理论上有被派发可能（需同消息并发+终态同微秒落窗，现实概率极低）。正解=受理/凭据/派发检查纳入同一 per-task 异步锁（lane 锁 tokio 化或独立接受锁），随真实 adapter 落地时一并做。
 - 偏差（实施方记录，主 agent 复核认可）：facts 加 `latest_run()`（中断卡面需要读取 API）；重送回复按 acceptance_for 区分 started/waiting 两文案；boot_sweep 在 build_kernel 后置接线。
 
-### 后续：下游集成说明（W3/W5）+ Kimi ACP 契约测试接入 —— 进行中
+### 增量 7：Kimi ACP 真实契约测试接入 —— ✅ 已验收（commit `bca2a403`）
+
+- 性质：通用测试接入（handoff 缺下游条款允许）；`exec/acp_harness.rs`（568 行，#[cfg(test)] ACP stdio 客户端 + AcpHarnessAdapter）+ 4 场景契约套件（#[ignore]+`YOMI_ACP_E2E=1` 门）。
+- **主 agent 亲跑取证（kimi 2.1.0 真实调用，12.45s 4/4 过）**：
+  - s1 创建→绑定→运行→事实：原生 session 绑定落库，正文 HARNESS_OK 保存归属该 run。
+  - s2 真实取消：长 prompt 中途 stop_and_pause → `terminal_kind=cancelled`、run=Stopped、暂停保持；恢复后同 Session 续跑（RESUMED_OK）。
+  - s3 释放→恢复：release 后新输入经 `session/load` 跨进程恢复原 Session，暗号 GIRAFFE-00532BC8 原样召回（D9 全链路实证）。
+  - s4 两卡隔离：X 停止时 Y 继续运行 5s 无扰；Y 各自 cancel 生效（D11 实证）。
+- **实证补记（强化下游要求）**：s2 中被取消轮无正文 → 下一轮结果按轮序规则错配到该轮 seq——chat-flow-downstream-integration §1.2 run 身份回显硬化要求的真实佐证，不再只是推断。
+- 结论：**ExecAdapter 契约对真实双向 Provider 成立**（Kimi 路径）；Codex 路径待下游。
+
+### 后续：P5 不依赖真卡凭据的通用部分评估 —— 进行中
 ## 未验证项与所需条件（滚动清单）
 
 | 项 | 影响 | 所需条件 |

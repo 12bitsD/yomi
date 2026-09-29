@@ -72,6 +72,11 @@ pub(crate) async fn handle_incoming_message(
             if task.status == ExecTaskStatus::Archived {
                 return Ok(Some("⏹ 任务已归档，不接受新输入。".to_string()));
             }
+            // 增量 8（§8-L1）：空闲任务卡已过期的换代在受理前完成
+            // ——先换再受理。换代只换呈现，失败不阻断受理（D12/C9）。
+            if let Some(hub) = kernel.channel_manager() {
+                hub.renew_exec_task_card_on_return(&kernel, &task).await;
+            }
             let msg_id = msg.external_message_id.clone().unwrap_or_default();
             let outcome = kernel.exec_inbox().accept(
                 &task.id,

@@ -102,6 +102,9 @@ pub struct Kernel {
     /// 执行调度器（chat-flow 增量 3，N6/C3/D11）：每卡 lane 单一
     /// 裁定者 + 全局名额统一分配。
     exec_scheduler: Arc<crate::exec::ExecScheduler>,
+    /// `[exec]` 运行控制配置（增量 8 起保留：换代余量/sweep 周期
+    /// 等旋钮的运行时读取口；调度器构造时另取一份）。
+    exec_config: crate::config::ExecConfig,
     /// `SimAdapter` 控制柄（chat-flow 增量 4）：仅供测试与本地驱动
     /// 注入终态——生产挂起模式下不调用即无行为；P3 真实 adapter
     /// 替换后恒 None。
@@ -178,6 +181,12 @@ impl Kernel {
     /// 执行调度器（chat-flow 增量 3）。
     pub fn exec_scheduler(&self) -> Arc<crate::exec::ExecScheduler> {
         Arc::clone(&self.exec_scheduler)
+    }
+
+    /// `[exec]` 运行控制配置（只读；增量 8 换代余量/sweep 周期
+    /// 的读取口）。
+    pub fn exec_config(&self) -> &crate::config::ExecConfig {
+        &self.exec_config
     }
 
     /// 执行事件订阅口（broadcast；事件是提示不是事实源——C7/增量
@@ -644,7 +653,7 @@ impl Kernel {
                 exec_adapter,
                 exec_inbox.clone(),
                 exec_events_tx,
-                exec_config,
+                exec_config.clone(),
             )
             .with_facts(storage.exec_fact_store()),
         );
@@ -692,6 +701,7 @@ impl Kernel {
             exec_fact_store: storage.exec_fact_store(),
             exec_inbox,
             exec_scheduler,
+            exec_config,
             exec_sim_control,
             ext_routes: dashmap::DashMap::new(),
             notification_bus,

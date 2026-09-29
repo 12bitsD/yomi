@@ -277,7 +277,7 @@ impl Tool for TaskResultTool {
     }
 
     fn desc(&self) -> &'static str {
-        "读取执行任务某一轮的权威结果正文（Agent 原始完整正文，不改写）。seq 缺省 = 最新已保存轮；明确给出 seq 读对应轮——读旧轮不会读到新轮。读到的是已保存事实，解释时区分事实与推测。本工具只读：不发起、不恢复、不停止任何任务。超长正文按工具输出上限截断（完整 Markdown 导出在 P5 提供）。"
+        "读取执行任务某一轮的权威结果正文（Agent 原始完整正文，不改写）。seq 缺省 = 最新已保存轮；明确给出 seq 读对应轮——读旧轮不会读到新轮。读到的是已保存事实，解释时区分事实与推测。本工具只读：不发起、不恢复、不停止任何任务。超长正文按工具输出上限截断，同时自动导出完整 Markdown 并在输出中给出路径（导出失败会如实说明，不会显示可访问）。"
     }
 
     fn schema(&self) -> Value {
@@ -342,8 +342,10 @@ impl Tool for TaskResultTool {
             });
             return Ok(ToolOutput::text(out.to_string()));
         };
-        // 权威正文原样输出（N9：不改写）；超限按工具输出截断约定，
-        // 注明完整导出在 P5。
+        // 权威正文原样输出（N9：不改写）；超限按工具输出截断约定
+        // 给头部，同时自动导出完整 Markdown（增量 8，N9 首版交付
+        // 点）——导出成功给路径；导出失败与正文保存分开报错：未
+        // 成功不得显示可访问，如实说明（正文仍已安全保存）。
         let header = format!(
             "任务 `{}` · 第 {} 轮结果正文（{} 字节，保存于 {}）\n\n",
             &task.id.as_str()[..12.min(task.id.as_str().len())],
@@ -352,11 +354,26 @@ impl Tool for TaskResultTool {
             crate::storage::format_age(row.created_at),
         );
         let full = format!("{header}{}", row.body);
-        let text = crate::tools::helper::truncate_output(
-            &full,
-            ctx.max_tool_output_length,
-            "\n\n[正文超出工具输出上限已截断；完整 Markdown 全文导出在 P5 提供]",
-        );
+        let text = if full.len() > ctx.max_tool_output_length {
+            let export = crate::exec::export::export_result_markdown(
+                &kernel.exec_fact_store(),
+                &row.run_id,
+                &kernel.data_dir().await,
+            )
+            .await;
+            let suffix = match export {
+                Ok(path) => format!(
+                    "\n\n[正文超出工具输出上限已截断；完整 Markdown 已导出：{}]",
+                    path.display()
+                ),
+                Err(e) => format!(
+                    "\n\n[正文超出工具输出上限已截断；Markdown 导出失败（{e}）——正文仍已安全保存，可稍后重试]"
+                ),
+            };
+            crate::tools::helper::truncate_output(&full, ctx.max_tool_output_length, &suffix)
+        } else {
+            full
+        };
         Ok(ToolOutput::text(text))
     }
 }
@@ -661,5 +678,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("kernel is not available"), "{err}");
+    }
+
+    /// 增量 8（N9 首版交付点）：task_result 超限 → 自动导出完整
+    /// Markdown 并在输出中给路径；正文仍按截断约定给头部；导出
+    /// 文件正文字节级一致。
+    #[tokio::test]
+    async fn task_result_overflow_exports_markdown_and_reports_path() {
+        let (dir, kernel) = test_kernel().await;
+        // 超长中文正文（>> 2KB 上限）。
+        let body = "超长中文正文「」——逐字填充。".repeat(500);
+        let task = run_one_round(&kernel, "ex1", "目标导出", &body).await;
+        let tool = TaskResultTool::new(Arc::downgrade(&kernel));
+        let mut c = ctx();
+        c.max_tool_output_length = 2_000;
+
+        let out = tool
+            .exec(json!({ "task_id": task.id.as_str() }), c)
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(text.contains("已截断"), "{text}");
+        assert!(text.contains("完整 Markdown 已导出"), "{text}");
+        assert!(text.len() <= 2_000, "截断约定不变：{}", text.len());
+        // 截断给的是头部（原文开头在，结尾不在）。
+        assert!(text.contains("超长中文正文"), "{text}");
+
+        // 导出产物：`<data_dir>/exec-results/<task_id>/<run_id>.md`，
+        // 分隔线以下与权威正文逐字节一致。
+        let export_dir = dir
+            .path()
+            .join("data")
+            .join("exec-results")
+            .join(task.id.as_str());
+        let mut entries = tokio::fs::read_dir(&export_dir).await.unwrap();
+        let entry = entries.next_entry().await.unwrap().expect("export file");
+        assert!(
+            entries.next_entry().await.unwrap().is_none(),
+            "一轮一份导出"
+        );
+        assert!(entry.file_name().to_string_lossy().ends_with(".md"));
+        assert!(
+            text.contains(&entry.file_name().to_string_lossy().into_owned()),
+            "{text}"
+        );
+        let bytes = tokio::fs::read(entry.path()).await.unwrap();
+        let sep = b"\n\n---\n\n";
+        let at = bytes
+            .windows(sep.len())
+            .position(|w| w == sep)
+            .expect("attribution separator");
+        assert_eq!(&bytes[at + sep.len()..], body.as_bytes(), "正文字节级一致");
+
+        // 幂等：再次超限查询不覆盖（导出直接命中既存路径）。
+        let before = tokio::fs::metadata(entry.path()).await.unwrap();
+        let mut c = ctx();
+        c.max_tool_output_length = 2_000;
+        let out = tool
+            .exec(json!({ "task_id": task.id.as_str() }), c)
+            .await
+            .unwrap();
+        assert!(out.text_content().contains("完整 Markdown 已导出"));
+        let after = tokio::fs::metadata(entry.path()).await.unwrap();
+        assert_eq!(
+            before.modified().unwrap(),
+            after.modified().unwrap(),
+            "重复导出不改写既存文件"
+        );
+        kernel.close_tokens();
+    }
+
+    /// 增量 8：导出失败与正文保存分开报错——不显示可访问路径，
+    /// 如实说明失败原因与正文保存状态（N9）。
+    #[tokio::test]
+    async fn task_result_overflow_export_failure_is_reported_without_path() {
+        let (dir, kernel) = test_kernel().await;
+        let body = "超长中文正文「」——逐字填充。".repeat(500);
+        let task = run_one_round(&kernel, "ex2", "目标导出失败", &body).await;
+        // 让导出失败：`<data_dir>/exec-results` 被占位为普通文件，
+        // create_dir_all 必失败。
+        tokio::fs::write(dir.path().join("data").join("exec-results"), "blocked")
+            .await
+            .unwrap();
+        let tool = TaskResultTool::new(Arc::downgrade(&kernel));
+        let mut c = ctx();
+        c.max_tool_output_length = 2_000;
+
+        let out = tool
+            .exec(json!({ "task_id": task.id.as_str() }), c)
+            .await
+            .unwrap();
+        let text = out.text_content();
+        assert!(text.contains("Markdown 导出失败"), "{text}");
+        assert!(text.contains("正文仍已安全保存"), "{text}");
+        assert!(!text.contains("已导出"), "{text}");
+        assert!(!text.contains("exec-results/"), "{text}");
+        kernel.close_tokens();
     }
 }

@@ -8,7 +8,7 @@ use sqlx::sqlite::SqlitePool;
 use tracing::{info, warn};
 
 /// Current schema version - bump this when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 28;
+pub const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 /// A single database migration (can contain multiple SQL statements)
 struct Migration {
@@ -400,6 +400,22 @@ const MIGRATIONS: &[Migration] = &[
                 started INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (channel_name, msg_id)
             );"],
+    },
+    Migration {
+        version: 29,
+        // chat-flow 增量 8（§8-L1 换代期限事实列，设计依据
+        // docs/design/chat-flow-technical-design.md §8「保存消息发
+        // 送时间、实体创建时间及当前代次」）：`card_sent_at` 发卡
+        // 时刻（create_and_announce 经 set_thread_and_card 回填、
+        // 换代经 bump_card_generation 回填；v29 前存量行 NULL，换
+        // 代决策回退 created_at——卡即创建时所发）。`card_entity_
+        // created_at` 预留给 CardKit 实体启用后回填（实体 14 天期
+        // 限的判据；未启用恒 NULL，决策只用消息期限）。
+        name: "add_exec_card_renewal_facts",
+        sqls: &[
+            r"ALTER TABLE exec_tasks ADD COLUMN card_sent_at DATETIME;",
+            r"ALTER TABLE exec_tasks ADD COLUMN card_entity_created_at DATETIME;",
+        ],
     },
 ];
 

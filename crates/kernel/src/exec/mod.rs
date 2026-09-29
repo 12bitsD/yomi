@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(test)]
 pub mod acp_harness;
 pub mod adapter;
+pub mod export;
 pub mod facts;
 pub mod inbox;
 pub mod run;
@@ -212,6 +213,15 @@ pub struct ExecTask {
     pub card_msg_id: Option<String>,
     /// 0 = 尚无卡；L1 换代递增
     pub card_generation: i64,
+    /// 当前代主卡的发卡时刻（增量 8，§8-L1 消息 14 天更新期限的
+    /// 判据）：`create_and_announce` 经 `set_thread_and_card` 回填、
+    /// 换代经 `bump_card_generation` 回填；v29 前存量行 NULL（换
+    /// 代决策回退 `created_at`——卡即创建时所发）。
+    pub card_sent_at: Option<DateTime<Utc>>,
+    /// `CardKit` 实体创建时刻（增量 8 预留，§8 实体 14 天期限的判
+    /// 据）：CardKit 启用后回填；未启用恒 NULL，换代决策只用消
+    /// 息期限。
+    pub card_entity_created_at: Option<DateTime<Utc>>,
     /// 任务目标/首轮原文摘要
     pub goal: String,
     pub working_dir: Option<String>,
@@ -273,12 +283,27 @@ pub trait ExecTaskStore: Send + Sync {
     /// tracing（表不加列）。
     async fn mark_broken(&self, id: &ExecTaskId, reason: &str) -> Result<ExecTask>;
 
-    /// 回填 Thread 根消息与卡片消息（增量 2 用，本增量实现+测）。
+    /// 回填 Thread 根消息与卡片消息（增量 2 用，本增量实现+测；
+    /// 增量 8 起同时回填发卡时刻 `card_sent_at`——§8-L1 期限判据）。
     async fn set_thread_and_card(
         &self,
         id: &ExecTaskId,
         thread_root_msg_id: &str,
         card_msg_id: &str,
+    ) -> Result<ExecTask>;
+
+    /// L1 换代切换当前映射（增量 8，§8-L1/C2）：**先确认后切换**
+    /// ——平台回执拿到新卡 msg id（新卡确认可定位）才调用；`card_
+    /// generation` 原子 +1（旧代回调自此被重核拒绝），发卡时刻回
+    /// 填为 `sent_at`。`thread_root_msg_id` 由调用方给出（原 Thread
+    /// 换代时根不变——新卡落在同一 Thread 内，锚仍是旧卡）。换代
+    /// 只换呈现：本方法不触碰 binding/status/goal 等任何执行身份。
+    async fn bump_card_generation(
+        &self,
+        id: &ExecTaskId,
+        thread_root_msg_id: &str,
+        card_msg_id: &str,
+        sent_at: DateTime<Utc>,
     ) -> Result<ExecTask>;
 
     /// 归档（`Active -> Archived`）；归档不删行（D8）。

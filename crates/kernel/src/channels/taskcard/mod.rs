@@ -17,6 +17,7 @@
 //!   路径（事件/点击只是提示，快照是事实）。
 
 pub(crate) mod relay;
+pub(crate) mod renewal;
 
 use std::sync::Arc;
 

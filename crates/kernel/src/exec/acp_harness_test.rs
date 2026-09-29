@@ -76,6 +76,8 @@ impl Rig {
                     stop_confirm_timeout_secs: 60,
                     // 套件内不触发空闲释放（场景 3 手动 release）。
                     idle_release_secs: 3600,
+                    card_renew_margin_secs: 129_600,
+                    card_renew_sweep_secs: 1800,
                 },
             )
             .with_facts(facts.clone()),

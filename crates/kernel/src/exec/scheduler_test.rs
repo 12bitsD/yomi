@@ -57,6 +57,8 @@ async fn harness_with(
             // 默认测试台：释放阈值拉到 1 小时——既有用例不触发空
             // 闲释放；释放场景走 `harness_idle`。
             idle_release_secs: 3600,
+            card_renew_margin_secs: 129_600,
+            card_renew_sweep_secs: 1800,
         },
     ));
     Harness {
@@ -99,6 +101,8 @@ async fn harness_facts(adapter: SimAdapter) -> Harness {
                 max_concurrent_runs: 2,
                 stop_confirm_timeout_secs: 30,
                 idle_release_secs: 3600,
+                card_renew_margin_secs: 129_600,
+                card_renew_sweep_secs: 1800,
             },
         )
         .with_facts(facts.clone()),
@@ -138,6 +142,8 @@ async fn harness_idle(adapter: SimAdapter, idle_release_secs: u64) -> (Harness, 
                 max_concurrent_runs: 2,
                 stop_confirm_timeout_secs: 30,
                 idle_release_secs,
+                card_renew_margin_secs: 129_600,
+                card_renew_sweep_secs: 1800,
             },
         )
         .with_facts(facts.clone()),
@@ -171,6 +177,8 @@ fn restarted(h: &Harness, pool: &sqlx::SqlitePool) -> Harness {
                 max_concurrent_runs: 2,
                 stop_confirm_timeout_secs: 30,
                 idle_release_secs: 3600,
+                card_renew_margin_secs: 129_600,
+                card_renew_sweep_secs: 1800,
             },
         )
         .with_facts(facts.clone()),
@@ -639,6 +647,17 @@ impl ExecTaskStore for ConflictingBindStore {
     ) -> Result<ExecTask> {
         self.inner
             .set_thread_and_card(id, thread_root_msg_id, card_msg_id)
+            .await
+    }
+    async fn bump_card_generation(
+        &self,
+        id: &ExecTaskId,
+        thread_root_msg_id: &str,
+        card_msg_id: &str,
+        sent_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<ExecTask> {
+        self.inner
+            .bump_card_generation(id, thread_root_msg_id, card_msg_id, sent_at)
             .await
     }
     async fn archive(&self, id: &ExecTaskId) -> Result<ExecTask> {

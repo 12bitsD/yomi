@@ -126,6 +126,8 @@ KIMI_AGENT_API_KEY = "sk-..."
 |---|---|---|---|
 | `max_concurrent_runs` | integer | 全局并发 Run 名额（按卡隔离、统一分配；min 1） | `2` |
 | `stop_confirm_timeout_secs` | integer | 停止确认超时（秒）：超时未报原生终态 → 标记 `StopUnconfirmed` 并保留 Stopping | `30` |
+| `card_renew_margin_secs` | integer | 主卡换代余量（秒）：活跃/待回答任务在最早适用更新期限（消息 14 天 / CardKit 实体 14 天，取较早者）前留出本余量即换代 | `129600`（36h） |
+| `card_renew_sweep_secs` | integer | 主卡换代 sweep 周期（秒）：hub relay 同进程的低频清扫，对活动任务跑换代决策并执行临期换代 | `1800`（30min） |
 
 执行任务功能按通道启用（`[[channels]]` 的 `exec_tasks`，默认 `false`）。
 

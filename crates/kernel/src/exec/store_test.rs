@@ -161,6 +161,9 @@ async fn test_mark_broken_readable_and_from_uninitialized() {
 async fn test_set_thread_and_card_and_find_by_dedup() {
     let store = create_test_store().await;
     let (task, _) = store.create(&input("feishu", "k1", "g")).await.unwrap();
+    // 未发卡时期限事实列为 NULL（v29 增量 8）。
+    assert_eq!(task.card_sent_at, None);
+    assert_eq!(task.card_entity_created_at, None);
 
     let updated = store
         .set_thread_and_card(&task.id, "om_thread_root", "om_card")
@@ -171,15 +174,68 @@ async fn test_set_thread_and_card_and_find_by_dedup() {
         Some("om_thread_root")
     );
     assert_eq!(updated.card_msg_id.as_deref(), Some("om_card"));
+    // 发卡时刻随回填写入（增量 8，§8-L1 期限判据）。
+    let sent_at = updated
+        .card_sent_at
+        .expect("card_sent_at backfilled on announce");
+    assert!(
+        (chrono::Utc::now() - sent_at) < chrono::Duration::minutes(1),
+        "{sent_at}"
+    );
 
     // find_by_dedup 命中且读得到回填值
     let found = store.find_by_dedup("feishu", "k1").await.unwrap().unwrap();
     assert_eq!(found.id, task.id);
     assert_eq!(found.thread_root_msg_id.as_deref(), Some("om_thread_root"));
+    assert_eq!(found.card_sent_at, Some(sent_at));
 
     // 不存在 id → Err
     let missing = store
         .set_thread_and_card(&ExecTaskId::new(), "t", "c")
+        .await;
+    assert!(missing.is_err());
+}
+
+/// 增量 8（§8-L1/C2）：换代切换——代次原子 +1、映射更新、发卡时
+/// 刻回填；执行身份列不动；不存在 id 报错。
+#[tokio::test]
+async fn test_bump_card_generation_switches_mapping_atomically() {
+    let store = create_test_store().await;
+    let (task, _) = store.create(&input("feishu", "k1", "g")).await.unwrap();
+    let announced = store
+        .set_thread_and_card(&task.id, "om_root", "om_card_1")
+        .await
+        .unwrap();
+    let first_sent_at = announced.card_sent_at.unwrap();
+
+    let sent_at = chrono::Utc::now();
+    let bumped = store
+        .bump_card_generation(&task.id, "om_root", "om_card_2", sent_at)
+        .await
+        .unwrap();
+    assert_eq!(bumped.card_generation, announced.card_generation + 1);
+    assert_eq!(bumped.card_msg_id.as_deref(), Some("om_card_2"));
+    // 原 Thread 换代根不变（新卡落在同一 Thread 内）。
+    assert_eq!(bumped.thread_root_msg_id.as_deref(), Some("om_root"));
+    assert_eq!(bumped.card_sent_at, Some(sent_at));
+    assert_ne!(bumped.card_sent_at, Some(first_sent_at));
+    // 只换呈现：执行身份列逐项不动（D12）。
+    assert_eq!(bumped.binding, announced.binding);
+    assert_eq!(bumped.provider_session_id, announced.provider_session_id);
+    assert_eq!(bumped.status, announced.status);
+    assert_eq!(bumped.goal, announced.goal);
+    assert_eq!(bumped.dedup_key, announced.dedup_key);
+
+    // 再换一代：代次继续向前。
+    let bumped2 = store
+        .bump_card_generation(&task.id, "om_root", "om_card_3", chrono::Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(bumped2.card_generation, bumped.card_generation + 1);
+
+    // 不存在 id → Err。
+    let missing = store
+        .bump_card_generation(&ExecTaskId::new(), "t", "c", chrono::Utc::now())
         .await;
     assert!(missing.is_err());
 }

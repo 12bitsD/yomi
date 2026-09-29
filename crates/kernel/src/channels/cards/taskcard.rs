@@ -258,6 +258,8 @@ mod tests {
             thread_root_msg_id: None,
             card_msg_id: None,
             card_generation: 0,
+            card_sent_at: None,
+            card_entity_created_at: None,
             goal: "把登錄頁的校驗邏輯抽出來獨立成模塊，跑通全量測試，再補一條用例覆蓋空輸入與超時"
                 .into(),
             working_dir: None,

@@ -285,6 +285,17 @@ fn response_for(method: &str, path: &str) -> Vec<u8> {
         "PATCH" if p.starts_with("/open-apis/im/v1/messages/") => {
             r#"{"code":0,"msg":"ok"}"#.into()
         }
+        // CardKit（增量 8 请求构造测试）：创建实体回 card_id；局部
+        // 更新与流式文本更新回空 data。
+        "POST" if p == "/open-apis/cardkit/v1/cards" => {
+            r#"{"code":0,"msg":"ok","data":{"card_id":"7355372766134157313"}}"#.into()
+        }
+        "POST" if p.starts_with("/open-apis/cardkit/v1/cards/") && p.ends_with("/batch_update") => {
+            r#"{"code":0,"msg":"ok","data":{}}"#.into()
+        }
+        "PUT" if p.starts_with("/open-apis/cardkit/v1/cards/") && p.ends_with("/content") => {
+            r#"{"code":0,"msg":"ok","data":{}}"#.into()
+        }
         "POST" if p.starts_with("/open-apis/drive/v1/permissions/") => {
             r#"{"code":0,"msg":"ok","data":{}}"#.into()
         }
@@ -389,6 +400,74 @@ async fn update_card_patches_message_content() {
 
     let req = stub.find("PATCH", "/open-apis/im/v1/messages/om_1");
     assert_eq!(StubFeishu::body_json(&req)["content"], card);
+}
+
+// ── CardKit 请求构造（增量 8；未实测——P0 门槛，只验证构造）──────
+
+#[tokio::test]
+async fn cardkit_create_posts_card_json_entity() {
+    let stub = StubFeishu::start().await;
+    let adapter = stub_adapter(&stub.base_url);
+    let card = r#"{"schema":"2.0","body":{"elements":[]}}"#;
+
+    let id = adapter.cardkit_create(card).await.unwrap();
+
+    assert_eq!(id.as_deref(), Some("7355372766134157313"));
+    let req = stub.find("POST", "/open-apis/cardkit/v1/cards");
+    assert_eq!(req.1, "/open-apis/cardkit/v1/cards");
+    let v = StubFeishu::body_json(&req);
+    // 官方契约：卡片 JSON 转义为字符串入 `data`。
+    assert_eq!(v["type"], "card_json");
+    assert_eq!(v["data"], card);
+}
+
+#[tokio::test]
+async fn cardkit_batch_update_posts_actions_with_sequence_and_uuid() {
+    let stub = StubFeishu::start().await;
+    let adapter = stub_adapter(&stub.base_url);
+    let updates = serde_json::json!([
+        { "action": "partial_update_element",
+          "params": { "element_id": "md_1", "partial_element": { "content": "新文本" } } }
+    ]);
+
+    adapter
+        .cardkit_batch_update("7355", &updates, 41, "uuid-1")
+        .await
+        .unwrap();
+
+    let req = stub.find("POST", "/open-apis/cardkit/v1/cards/7355/batch_update");
+    assert_eq!(req.0, "POST");
+    assert_eq!(req.1, "/open-apis/cardkit/v1/cards/7355/batch_update");
+    let v = StubFeishu::body_json(&req);
+    assert_eq!(v["uuid"], "uuid-1");
+    assert_eq!(v["sequence"], 41);
+    // 官方契约：操作数组转义为字符串入 `actions`，内容逐项一致。
+    let actions: serde_json::Value = serde_json::from_str(v["actions"].as_str().unwrap()).unwrap();
+    assert_eq!(actions, updates);
+}
+
+#[tokio::test]
+async fn cardkit_element_content_update_puts_full_content_with_sequence() {
+    let stub = StubFeishu::start().await;
+    let adapter = stub_adapter(&stub.base_url);
+
+    adapter
+        .cardkit_element_content_update("7355", "md_1", "更新后的全量文本", 42)
+        .await
+        .unwrap();
+
+    let req = stub.find(
+        "PUT",
+        "/open-apis/cardkit/v1/cards/7355/elements/md_1/content",
+    );
+    assert_eq!(req.0, "PUT");
+    assert_eq!(
+        req.1,
+        "/open-apis/cardkit/v1/cards/7355/elements/md_1/content"
+    );
+    let v = StubFeishu::body_json(&req);
+    assert_eq!(v["content"], "更新后的全量文本");
+    assert_eq!(v["sequence"], 42);
 }
 
 #[tokio::test]

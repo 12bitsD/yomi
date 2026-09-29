@@ -204,6 +204,10 @@ impl ChannelHub {
             // 只是提示，锁内重读快照渲染；仅当存在启用 exec_tasks
             // 的通道实例——spawn 内自查，无则 warn 记录跳过）。
             crate::channels::taskcard::relay::spawn_exec_relay(self, &coord);
+            // chat-flow 增量 8（§8-L1）：换代 sweep——relay 同进程
+            // 的低频清扫，活跃任务在更新期限前换代（空闲过期任务
+            // 留给分流臂「用户返回即换代」）。
+            crate::channels::taskcard::relay::spawn_renewal_sweep(self, &coord);
             // chat-flow 增量 6（N11/D9）：重启后卡面如实——对每个
             // 启用 exec_tasks 的通道实例，逐一刷新「本通道有卡的活
             // 动任务」卡面一次（受理数归零、中断轮可见、旧队列不显
@@ -1032,6 +1036,36 @@ impl ChannelHub {
             task_id,
         )
         .await;
+    }
+
+    /// 空闲任务卡过期时的「用户返回即换代」（chat-flow 增量 8，
+    /// §8-L1）：分流臂受理前调用——决策为 `RenewOnReturn` 才换
+    /// （先换再受理）。换代只换呈现（D12）；换代失败
+    /// （`SendUncertain`）不阻断受理——受理是执行侧语义，呈现缺
+    /// 失由刷新路径如实反映（C9）。
+    pub(crate) async fn renew_exec_task_card_on_return(
+        &self,
+        kernel: &Arc<Kernel>,
+        task: &crate::exec::ExecTask,
+    ) {
+        let margin = std::time::Duration::from_secs(kernel.exec_config().card_renew_margin_secs);
+        let outcome = crate::channels::taskcard::renewal::renew_on_return_if_due(
+            kernel,
+            &self.instances,
+            &self.exec_patches,
+            task,
+            margin,
+            chrono::Utc::now(),
+        )
+        .await;
+        if let crate::channels::taskcard::renewal::RenewOutcome::SendUncertain { error } = &outcome
+        {
+            warn!(
+                task_id = %task.id,
+                error,
+                "exec card renewal on return uncertain; input acceptance proceeds (presentation stays stale)"
+            );
+        }
     }
 
     /// Check whether a session is routed from an external channel, regardless

@@ -254,6 +254,13 @@ pub struct ExecConfig {
     /// 运行实例空闲超过本阈值即释放——不删历史、不动队列/暂停状
     /// 态（暂停且有等待项同样释放）；下次输入用原 Session 恢复。
     pub idle_release_secs: u64,
+    /// 主卡换代余量（秒，增量 8，§8-L1）：活跃/待回答任务在最早
+    /// 适用更新期限（消息 14 天 / `CardKit` 实体 14 天，取较早者）
+    /// 前留出本余量即换代——重试与 sweep 周期的缓冲。
+    pub card_renew_margin_secs: u64,
+    /// 主卡换代 sweep 周期（秒，增量 8）：hub relay 同进程的低频
+    /// 清扫，对活动任务跑换代决策并执行临期换代。
+    pub card_renew_sweep_secs: u64,
 }
 
 impl Default for ExecConfig {
@@ -262,6 +269,8 @@ impl Default for ExecConfig {
             max_concurrent_runs: 2,
             stop_confirm_timeout_secs: 30,
             idle_release_secs: 60,
+            card_renew_margin_secs: 129_600,
+            card_renew_sweep_secs: 1800,
         }
     }
 }

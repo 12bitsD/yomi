@@ -10,7 +10,9 @@
 //!   擅自补卡）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::broadcast::error::RecvError;
 use tracing::warn;
@@ -30,7 +32,9 @@ pub(crate) struct ExecCardPatches {
 impl ExecCardPatches {
     /// 取某任务的串行锁（无则建；同一卡任意时刻只有一个 PATCH 在
     /// 飞——等待者在锁上排队，拿到锁后重读快照，内容只向前）。
-    fn lock(&self, task_id: &ExecTaskId) -> Arc<tokio::sync::Mutex<()>> {
+    /// `pub(super)`：增量 8 换代执行（renewal）与刷新共用同一把
+    /// per-task 锁——换代与 PATCH 不得在同一卡上并发交错。
+    pub(super) fn lock(&self, task_id: &ExecTaskId) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(
             self.locks
                 .entry(task_id.clone())
@@ -128,6 +132,36 @@ pub(crate) fn spawn_exec_relay(hub: &ChannelHub, kernel: &Arc<Kernel>) {
                 }
                 Err(RecvError::Closed) => break,
             }
+        }
+    });
+}
+
+/// L1 换代 sweep（chat-flow 增量 8，§8-L1）：hub relay 同进程的
+/// 低频清扫（`exec.card_renew_sweep_secs`，默认 30 分钟），对
+/// `exec_tasks` 通道的活动有卡任务跑换代决策并执行临期换代
+/// （`RenewSoon`）；空闲过期任务不在这里换——`RenewOnReturn`
+/// 由分流臂在用户返回时执行。首 tick 延迟一个周期：启动时刻的
+/// 呈现一致性由 `start_all` 的 boot 刷新负责，sweep 只管周期换
+/// 代。与事件 relay 同一纪律：只持 Weak，kernel 拆毁即退出。
+pub(crate) fn spawn_renewal_sweep(hub: &ChannelHub, kernel: &Arc<Kernel>) {
+    let instances = hub.instances_handle();
+    if !instances.iter().any(|i| i.config.exec_tasks) {
+        warn!("no exec_tasks-enabled channel instance; exec renewal sweep skipped");
+        return;
+    }
+    let patches = hub.exec_patches();
+    let margin = Duration::from_secs(kernel.exec_config().card_renew_margin_secs);
+    let period = Duration::from_secs(kernel.exec_config().card_renew_sweep_secs);
+    let kernel_weak = Arc::downgrade(kernel);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            let Some(kernel) = kernel_weak.upgrade() else {
+                break;
+            };
+            super::renewal::sweep_once(&kernel, &instances, &patches, margin, Utc::now()).await;
         }
     });
 }
