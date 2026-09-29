@@ -120,6 +120,17 @@ KIMI_AGENT_API_KEY = "sk-..."
 
 ---
 
+## `[exec]` — 执行任务运行控制
+
+| 字段 | 类型 | 说明 | 默认值 |
+|---|---|---|---|
+| `max_concurrent_runs` | integer | 全局并发 Run 名额（按卡隔离、统一分配；min 1） | `2` |
+| `stop_confirm_timeout_secs` | integer | 停止确认超时（秒）：超时未报原生终态 → 标记 `StopUnconfirmed` 并保留 Stopping | `30` |
+
+执行任务功能按通道启用（`[[channels]]` 的 `exec_tasks`，默认 `false`）。
+
+---
+
 ## `[env]` — 环境变量注入
 
 启动时注入进程环境（键名按原样写入，**覆盖**主机同名变量）：
@@ -180,6 +191,7 @@ app_secret = "..."
 | `history_context` | 触发时注入的最近聊天记录条数（0 关闭） | `20` |
 | `admin_users` | 管理员 `open_id` 列表（`/restart`、`/permits` 等命令与审批按钮鉴权） | `[]` |
 | `approval_chat_id` | 飞书云文档权限申请的通知群；未配置则私聊 `admin_users` | — |
+| `exec_tasks` | 执行任务功能开关：`/task` 入口、任务 Thread 分流与 `task_create` 工具（关闭时 `/task` 明确拒绝、分流落回原 chat 路径） | `false` |
 | `disabled_events` | 运行时停用的平台事件（飞书支持 `doc_comment`） | `[]` |
 
 运行期命令：`/thread <文本>` 一次性开话题回复；`/threads on|off|reset` 按群覆盖 `reply_in_thread`（admin）。

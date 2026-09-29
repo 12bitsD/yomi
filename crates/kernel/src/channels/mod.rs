@@ -176,6 +176,11 @@ pub struct ChannelConfig {
     /// both are unset the feature is off (applications are only logged).
     #[serde(default)]
     pub approval_chat_id: Option<String>,
+    /// 执行任务功能开关（chat-flow 增量 3，R7）：默认 false——未启用
+    /// 的通道保持原行为：`/task` 明确拒绝、任务 Thread 分流关闭
+    /// （落回原 chat 路径）、`task_create` 工具在本通道路由下拒绝。
+    #[serde(default)]
+    pub exec_tasks: bool,
     /// `open_id`s allowed to approve/deny doc-permission applications
     /// (buttons and `/approve` `/deny` `/permits` commands alike). Also the
     /// DM recipients when `approval_chat_id` is unset.
@@ -236,6 +241,7 @@ impl Default for ChannelConfig {
             mid_run_split: true,
             history_context: default_history_context(),
             approval_chat_id: None,
+            exec_tasks: false,
             admin_users: Vec::new(),
             disabled_events: Vec::new(),
         }

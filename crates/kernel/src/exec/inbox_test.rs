@@ -69,3 +69,36 @@ async fn concurrent_resend_accepts_once() {
     assert_eq!(accepted, 1);
     assert_eq!(inbox.len(&id), 1);
 }
+
+#[test]
+fn pop_keeps_dedup_memory_and_seq_watermark() {
+    let inbox = ExecInbox::new();
+    let id = task();
+
+    // 增量 3 弹出消费后：去重记忆与序号水位不清除（C1 受理是一次
+    // 性事实；序号进程内单调）。
+    assert_eq!(
+        inbox.accept(&id, "m1", "ou_a", "第一条", vec![]),
+        AcceptOutcome::Accepted { seq: 1 }
+    );
+    assert_eq!(inbox.pop_front(&id).map(|i| i.seq), Some(1));
+    assert_eq!(inbox.len(&id), 0);
+
+    // 队空后新输入序号接续（不重置回 1）。
+    assert_eq!(
+        inbox.accept(&id, "m2", "ou_a", "第二条", vec![]),
+        AcceptOutcome::Accepted { seq: 2 }
+    );
+    // 已弹出消息的重送仍是 Duplicate。
+    assert_eq!(
+        inbox.accept(&id, "m1", "ou_a", "第一条", vec![]),
+        AcceptOutcome::Duplicate
+    );
+    assert_eq!(inbox.len(&id), 1);
+
+    // peek 不消费；pop 出队队首。
+    assert_eq!(inbox.peek_front(&id).map(|i| i.seq), Some(2));
+    assert_eq!(inbox.len(&id), 1);
+    assert_eq!(inbox.pop_front(&id).map(|i| i.seq), Some(2));
+    assert!(inbox.is_empty(&id));
+}

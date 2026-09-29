@@ -94,8 +94,11 @@ pub struct Kernel {
     /// 持久化。取自 `StorageSet`，不经 `Kernel::new` 参数。
     exec_task_store: Arc<dyn crate::exec::ExecTaskStore>,
     /// 任务 Thread 输入的进程内受理登记（chat-flow 增量 2，D2：
-    /// 重启清空）。
+    /// 重启清空）。与 `exec_scheduler` 共享同一实例。
     exec_inbox: crate::exec::ExecInbox,
+    /// 执行调度器（chat-flow 增量 3，N6/C3/D11）：每卡 lane 单一
+    /// 裁定者 + 全局名额统一分配。
+    exec_scheduler: Arc<crate::exec::ExecScheduler>,
     /// `ext_route` 的内存回退路由表（无 channel store 时）：(source, key)
     /// → session。纯内存，daemon 重启后首个 emit 重建映射。
     ext_routes: dashmap::DashMap<(String, String), SessionId>,
@@ -157,6 +160,17 @@ impl Kernel {
     /// 任务 Thread 输入的受理登记（进程内语义，重启清空——D2）。
     pub fn exec_inbox(&self) -> &crate::exec::ExecInbox {
         &self.exec_inbox
+    }
+
+    /// 执行调度器（chat-flow 增量 3）。
+    pub fn exec_scheduler(&self) -> Arc<crate::exec::ExecScheduler> {
+        Arc::clone(&self.exec_scheduler)
+    }
+
+    /// 执行事件订阅口（broadcast；事件是提示不是事实源——C7/增量
+    /// 4 通道侧刷新用）。
+    pub fn exec_events(&self) -> tokio::sync::broadcast::Receiver<crate::exec::ExecEvent> {
+        self.exec_scheduler.subscribe()
     }
 
     /// 执行任务的唯一创建契约（chat-flow N1/C2）：slash `/task` 与
@@ -467,6 +481,7 @@ impl Kernel {
         models: Vec<crate::provider::ModelConfig>,
         tasks_config: crate::config::TasksConfig,
         gc_config: crate::config::GcConfig,
+        exec_config: crate::config::ExecConfig,
         update_session_title: bool,
         config_auto_approve: Level,
     ) -> Result<Arc<Self>> {
@@ -588,6 +603,46 @@ impl Kernel {
             None
         };
 
+        // ── chat-flow 增量 3：执行调度器装配 ──────────────────
+        // 终态回调口（C4）：adapter 经 sink 上报终态，泵循环转
+        // `ExecScheduler::terminal`。
+        let (exec_sink, exec_sink_rx) = crate::exec::ExecAdapterSink::channel();
+        // 生产装配 = 挂起模式 SimAdapter（P3 由真实双 Provider
+        // adapter 替换）：不报完成、不报取消确认——无真实 Provider
+        // 时不伪造任何进展。
+        let exec_adapter: Arc<dyn crate::exec::ExecAdapter> =
+            Arc::new(crate::exec::SimAdapter::default().with_sink(exec_sink));
+        let (exec_events_tx, _) = tokio::sync::broadcast::channel(256);
+        let exec_inbox = crate::exec::ExecInbox::new();
+        let exec_scheduler = Arc::new(crate::exec::ExecScheduler::new(
+            storage.exec_task_store(),
+            exec_adapter,
+            exec_inbox.clone(),
+            exec_events_tx,
+            exec_config,
+        ));
+        // 终态回调泵 + 停止确认周期清扫（随 shutdown 拆除）。
+        tokio::spawn(
+            exec_scheduler
+                .clone()
+                .terminal_pump(exec_sink_rx, shutdown.child_token()),
+        );
+        {
+            let sweep = Arc::clone(&exec_scheduler);
+            let token = shutdown.child_token();
+            let mut tick = tokio::time::interval(exec_scheduler.sweep_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => break,
+                        _ = tick.tick() => sweep.sweep_unconfirmed(),
+                    }
+                }
+            });
+        }
+
         let kernel = Arc::new(Self {
             agent_shared,
             input_bus,
@@ -607,7 +662,8 @@ impl Kernel {
             kv_cache: storage.kv_cache(),
             channel_manager,
             exec_task_store: storage.exec_task_store(),
-            exec_inbox: crate::exec::ExecInbox::new(),
+            exec_inbox,
+            exec_scheduler,
             ext_routes: dashmap::DashMap::new(),
             notification_bus,
             shutdown,

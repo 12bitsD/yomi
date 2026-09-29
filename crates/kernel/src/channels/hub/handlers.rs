@@ -57,7 +57,9 @@ pub(crate) async fn handle_incoming_message(
     // 路径（不 prepare_trigger、不 steer、不建 chat session）。slash
     // 命令在任务 Thread 内不分流、保持旧语义（`/task` 由其命令臂拒
     // 绝嵌套）；未命中任务的 Thread 消息原逻辑零改动。
-    if matches!(cmd, ChannelCommand::None) {
+    // R7 开关（增量 3）：通道 `exec_tasks=false` → 分流关闭，落回
+    // 原 chat 路径。
+    if matches!(cmd, ChannelCommand::None) && config.exec_tasks {
         if let Some(task) = task_thread_hit(&kernel, adapter, channel_name, &msg).await? {
             // 归档不删历史，也不再受理新输入（D8）。
             if task.status == ExecTaskStatus::Archived {
@@ -86,6 +88,11 @@ pub(crate) async fn handle_incoming_message(
                         if let Err(e) = adapter.update_card(card_msg_id, &card).await {
                             warn!(error = %e, task_id = %task.id, "task card accepted-count refresh failed");
                         }
+                    }
+                    // 受理成功即尝试派发（增量 3）：暂停/阻断/有在飞
+                    // Run/无名额时自然不派发——C3 资格由 lane 锁裁定。
+                    if let Err(e) = kernel.exec_scheduler().try_dispatch(&task.id).await {
+                        warn!(error = %e, task_id = %task.id, "exec dispatch after accept failed");
                     }
                     return Ok(None);
                 }
@@ -239,12 +246,25 @@ pub(crate) async fn handle_incoming_message(
             "Usage: `/thread <text>` — the reply opens a new thread.".to_string(),
         )),
         ChannelCommand::Task { provider, goal } => {
+            // R7 开关（增量 3）：未启用通道明确拒绝（不登记、不发卡）。
+            if !config.exec_tasks {
+                return Ok(Some(
+                    "⛔ 本通道未启用执行任务功能（exec_tasks=false）。".to_string(),
+                ));
+            }
             handle_task_command(channel_name, &kernel, adapter, &msg, provider, goal).await
         }
-        ChannelCommand::InvalidTaskCommand => Ok(Some(
-            "Usage: `/task [kimi|codex] <goal>` — register an exec task on its own card thread."
-                .to_string(),
-        )),
+        ChannelCommand::InvalidTaskCommand => {
+            if !config.exec_tasks {
+                return Ok(Some(
+                    "⛔ 本通道未启用执行任务功能（exec_tasks=false）。".to_string(),
+                ));
+            }
+            Ok(Some(
+                "Usage: `/task [kimi|codex] <goal>` — register an exec task on its own card thread."
+                    .to_string(),
+            ))
+        }
         ChannelCommand::InvalidSteerCommand => Ok(Some(
             "Usage: `/steer <text>` — inject a message into the current run.".to_string(),
         )),

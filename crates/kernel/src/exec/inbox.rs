@@ -13,6 +13,7 @@ use crate::types::ExecTaskId;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 /// 一条已受理输入（原文 + 附件键，不做任何改写）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,9 +39,24 @@ pub enum AcceptOutcome {
 ///
 /// `DashMap` entry 提供 per-task 互斥：去重检查与定序 push 是一次原子
 /// 操作，并发重送与同卡并发新输入都不会乱序或双收。
-#[derive(Debug, Default)]
+///
+/// `Arc` 内核 + `Clone`：Kernel 与 `ExecScheduler` 共享同一实例
+/// （增量 3 调度器直接消费本队列），克隆句柄指向同一受理表。
+#[derive(Debug, Default, Clone)]
 pub struct ExecInbox {
-    inner: DashMap<ExecTaskId, VecDeque<AcceptedInput>>,
+    inner: Arc<DashMap<ExecTaskId, TaskInbox>>,
+}
+
+/// 单卡受理状态：队列 + 去重记忆 + 单调序号高水位。后两者在
+/// `pop_front` 后保留（进程内语义，D2）——受理是一次性事实（C1），
+/// 已消费输入的重送仍是 Duplicate，序号不因队空而重置。
+#[derive(Debug, Default)]
+struct TaskInbox {
+    queue: VecDeque<AcceptedInput>,
+    /// 已受理过的 `msg_id`（含已弹出）
+    seen: std::collections::HashSet<String>,
+    /// 最近一次受理序号（0 = 尚无输入；下一条 = `last_seq` + 1）
+    last_seq: u64,
 }
 
 impl ExecInbox {
@@ -48,8 +64,9 @@ impl ExecInbox {
         Self::default()
     }
 
-    /// 受理一条任务 Thread 输入。`msg_id` 已在列 → `Duplicate`（重送
-    /// 不扩大副作用）；否则定序 push 并返回受理序号。
+    /// 受理一条任务 Thread 输入。`msg_id` 已在列（含已弹出的历史，
+    /// C1：受理是一次性事实）→ `Duplicate`（重送不扩大副作用）；
+    /// 否则定序 push 并返回受理序号（进程内单调，弹出不清零）。
     pub fn accept(
         &self,
         task_id: &ExecTaskId,
@@ -60,11 +77,13 @@ impl ExecInbox {
     ) -> AcceptOutcome {
         let msg_id = msg_id.into();
         let mut entry = entry_or_default(&self.inner, task_id);
-        if entry.iter().any(|i| i.msg_id == msg_id) {
+        if entry.seen.contains(&msg_id) {
             return AcceptOutcome::Duplicate;
         }
-        let seq = entry.back().map_or(1, |i| i.seq + 1);
-        entry.push_back(AcceptedInput {
+        entry.seen.insert(msg_id.clone());
+        let seq = entry.last_seq + 1;
+        entry.last_seq = seq;
+        entry.queue.push_back(AcceptedInput {
             seq,
             msg_id,
             sender_open_id: sender_open_id.into(),
@@ -77,7 +96,24 @@ impl ExecInbox {
 
     /// 当前已受理条数（卡片「本进程已受理输入 n 条」的数据源）。
     pub fn len(&self, task_id: &ExecTaskId) -> usize {
-        self.inner.get(task_id).map_or(0, |q| q.len())
+        self.inner.get(task_id).map_or(0, |e| e.queue.len())
+    }
+
+    /// 队首输入（不取出——C3 资格检查与派发准备用；队首失败保留
+    /// 顺序位置，明确重试或撤回后才让后项继续）。
+    pub fn peek_front(&self, task_id: &ExecTaskId) -> Option<AcceptedInput> {
+        self.inner
+            .get(task_id)
+            .and_then(|e| e.queue.front().cloned())
+    }
+
+    /// 取出队首。唯一调用方是调度器在原生确认开始之后（增量 3）：
+    /// 确认前绝不 pop，未确认失败的输入不跳过（N3/C3）。去重记忆
+    /// 与序号水位不随弹出清除。
+    pub fn pop_front(&self, task_id: &ExecTaskId) -> Option<AcceptedInput> {
+        self.inner
+            .get_mut(task_id)
+            .and_then(|mut e| e.queue.pop_front())
     }
 
     #[cfg(test)]
@@ -90,16 +126,16 @@ impl ExecInbox {
     pub fn snapshot(&self, task_id: &ExecTaskId) -> Vec<AcceptedInput> {
         self.inner
             .get(task_id)
-            .map_or_else(Vec::new, |q| q.iter().cloned().collect())
+            .map_or_else(Vec::new, |e| e.queue.iter().cloned().collect())
     }
 }
 
 /// `DashMap::entry` 的 `ExecTaskId` 键版本（单独成函数只为让
 /// `accept` 的借用链一目了然）。
 fn entry_or_default<'a>(
-    map: &'a DashMap<ExecTaskId, VecDeque<AcceptedInput>>,
+    map: &'a DashMap<ExecTaskId, TaskInbox>,
     task_id: &ExecTaskId,
-) -> dashmap::mapref::one::RefMut<'a, ExecTaskId, VecDeque<AcceptedInput>> {
+) -> dashmap::mapref::one::RefMut<'a, ExecTaskId, TaskInbox> {
     map.entry(task_id.clone()).or_default()
 }
 

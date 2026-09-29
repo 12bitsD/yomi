@@ -236,6 +236,30 @@ impl Default for GcConfig {
     }
 }
 
+/// 执行任务运行控制（`[exec]` 顶层段，chat-flow 增量 3）。
+///
+/// 设计依据 docs/design/chat-flow-technical-design.md N3/C3：并发名额
+/// 是部署参数，统一分配、轮次间公平、不抢占当前 Run；停止确认超时
+/// 是 N6/C6「停止中≠已停止」的升级阈值。
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ExecConfig {
+    /// 全局并发 Run 名额（按卡隔离、统一分配；min 1）
+    pub max_concurrent_runs: usize,
+    /// 停止确认超时（秒）：cancel 受理后超时不报原生终态 → 标记
+    /// `StopUnconfirmed` 并保留 Stopping（未确认，继续禁写）
+    pub stop_confirm_timeout_secs: u64,
+}
+
+impl Default for ExecConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_runs: 2,
+            stop_confirm_timeout_secs: 30,
+        }
+    }
+}
+
 /// Editable kernel configuration and its effective startup representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelConfig {
@@ -273,6 +297,8 @@ pub struct Config {
     pub max_checkpoints: usize,
     /// Garbage-collection policy for expired session resources
     pub gc: GcConfig,
+    /// 执行任务运行控制（chat-flow 增量 3）
+    pub exec: ExecConfig,
     /// Socket auth password hash (`blake3:<hex>`), enforced on ws/wss
     /// transports only; unix sockets rely on filesystem permissions.
     /// `YOMI_SOCKET_AUTH_HASH` overrides. None = no auth.
@@ -300,6 +326,7 @@ impl Default for Config {
             features: FeaturesConfig::default(),
             max_checkpoints: 5,
             gc: GcConfig::default(),
+            exec: ExecConfig::default(),
             socket_auth_hash: None,
             channels: Vec::new(),
             models: vec![ModelConfig::default()],
@@ -518,6 +545,13 @@ impl Config {
             return Err(KernelError::config(format!(
                 "gc.retention_days must be at least 1, got {}",
                 self.gc.retention_days
+            )));
+        }
+
+        if self.exec.max_concurrent_runs < 1 {
+            return Err(KernelError::config(format!(
+                "exec.max_concurrent_runs must be at least 1, got {}",
+                self.exec.max_concurrent_runs
             )));
         }
 

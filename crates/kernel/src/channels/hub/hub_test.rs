@@ -1191,6 +1191,7 @@ async fn test_start_and_shutdown() {
             approval_chat_id: None,
             admin_users: vec![],
             disabled_events: vec![],
+            exec_tasks: false,
         },
         ChannelConfig {
             name: "mock2".to_string(),
@@ -1212,6 +1213,7 @@ async fn test_start_and_shutdown() {
             approval_chat_id: None,
             admin_users: vec![],
             disabled_events: vec![],
+            exec_tasks: false,
         },
     ];
 

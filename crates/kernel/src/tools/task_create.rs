@@ -145,6 +145,22 @@ impl Tool for TaskCreateTool {
             return Ok(ToolOutput::text(out.to_string()));
         };
 
+        // R7 开关（增量 3）：按路由到的通道配置检查；无通道路由的
+        // 本地会话已在上面 no_channel 分支放行。
+        if let Some(hub) = &self.channel_hub {
+            if let Some(cfg) = hub.channel_config(&routing.channel_name) {
+                if !cfg.exec_tasks {
+                    let out = json!({
+                        "created": false,
+                        "state": "disabled",
+                        "channel": routing.channel_name,
+                        "note": "路由到的通道未启用执行任务功能（exec_tasks=false）：未登记任务。",
+                    });
+                    return Ok(ToolOutput::text(out.to_string()));
+                }
+            }
+        }
+
         let input = CreateExecTask {
             channel_name: routing.channel_name.clone(),
             ..input

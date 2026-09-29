@@ -953,6 +953,12 @@ impl ChannelHub {
         Ok(Some((routing, adapter)))
     }
 
+    /// 通道配置只读取口（`task_create` 工具的 `exec_tasks` 开关
+    /// 检查用，R7）。
+    pub(crate) fn channel_config(&self, name: &str) -> Option<ChannelConfig> {
+        self.instances.get(name).map(|i| i.config.clone())
+    }
+
     /// Check whether a session is routed from an external channel, regardless
     /// of whether the channel instance is currently running.
     pub async fn is_channel_session(&self, session_id: &SessionId) -> bool {
