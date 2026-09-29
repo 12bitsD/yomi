@@ -204,6 +204,33 @@ impl ChannelHub {
             // 只是提示，锁内重读快照渲染；仅当存在启用 exec_tasks
             // 的通道实例——spawn 内自查，无则 warn 记录跳过）。
             crate::channels::taskcard::relay::spawn_exec_relay(self, &coord);
+            // chat-flow 增量 6（N11/D9）：重启后卡面如实——对每个
+            // 启用 exec_tasks 的通道实例，逐一刷新「本通道有卡的活
+            // 动任务」卡面一次（受理数归零、中断轮可见、旧队列不显
+            // 示仍可恢复）。刷新内部走同一「快照渲染 + 串行 PATCH」
+            // 路径；单个失败只 warn（呈现待同步，C9）。
+            let exec_channels: Vec<String> = self
+                .instances
+                .iter()
+                .filter(|i| i.config.exec_tasks)
+                .map(|i| i.key().clone())
+                .collect();
+            for channel in exec_channels {
+                match coord
+                    .exec_fact_store()
+                    .active_tasks_with_card(&channel)
+                    .await
+                {
+                    Ok(task_ids) => {
+                        for task_id in task_ids {
+                            self.refresh_exec_task_card(&coord, &task_id).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(channel = %channel, error = %e, "exec boot card refresh: task lookup failed");
+                    }
+                }
+            }
         }
 
         if errors.is_empty() {

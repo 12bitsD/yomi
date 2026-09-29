@@ -13,23 +13,34 @@
 //!   与失配回调在权威状态重核后一律不生效；
 //! - R4：业务失败不冒充任务成功——失败轮如实标「失败」。
 //!
+//! 增量 6 追加（N11/D9/C8/N10）：
+//! - 中断轮如实显示：重启后 lane 无 current，最近一轮若在启动核
+//!   对中被标 `interrupted`，卡面显示「已中断（进程重启）· 待核
+//!   对」——不凭旧 binding/running 显示一切正常；
+//! - 释放如实显示：运行实例空闲释放后卡面加「已释放」一行——
+//!   不删历史、不动队列/暂停，下次输入恢复原 Session。
+//!
 //! 整卡 send/PATCH（schema 2.0，与 info 卡同信封风格）；CardKit
 //! 局部更新是 P5 的事。
 
 use serde_json::json;
 
-use crate::exec::{BindingState, ExecResultRow, ExecTask, ExecTaskStatus, LaneSnapshot, RunStatus};
+use crate::exec::{
+    BindingState, ExecResultRow, ExecRunRow, ExecTask, ExecTaskStatus, LaneSnapshot, RunStatus,
+};
 
 /// 主卡整卡 JSON（快照渲染）。`card_generation` 只进按钮 value
 /// （C9 旧代重核凭据），不参与卡面内容。`latest_result` 是任务最
 /// 新一份已保存的权威正文行（增量 5，N9）——存在时状态区下方
 /// 加结果行；完整结果区/附件入口/历史轮次是 P5，本增量只让
-/// 「已保存」可见。
+/// 「已保存」可见。`latest_run` 是任务最近一轮 Run 事实（增量
+/// 6，N11）——仅当 lane 无 current（重启后）时用于中断轮显示。
 pub(crate) fn task_card(
     task: &ExecTask,
     snap: &LaneSnapshot,
     card_generation: i64,
     latest_result: Option<&ExecResultRow>,
+    latest_run: Option<&ExecRunRow>,
 ) -> String {
     let id_short = &task.id.as_str()[..12.min(task.id.as_str().len())];
     let mut elements = vec![json!({
@@ -39,11 +50,13 @@ pub(crate) fn task_card(
              - **状态**: {}\n\
              - **队列**: {}\n\
              {}\
+             {}\
              - **创建者**: `{}` · **创建**: {}",
             task.provider,
-            status_line(task, snap),
+            status_line(task, snap, latest_run),
             queue_line(snap),
             result_line(latest_result),
+            release_line(snap),
             task.created_by,
             crate::storage::format_age(task.created_at),
         ),
@@ -70,8 +83,8 @@ pub(crate) fn task_card(
     .to_string()
 }
 
-/// 状态区一行（如实映射增量 3 lane 语义）。
-fn status_line(task: &ExecTask, snap: &LaneSnapshot) -> String {
+/// 状态区一行（如实映射增量 3 lane 语义 + 增量 6 中断轮）。
+fn status_line(task: &ExecTask, snap: &LaneSnapshot, latest_run: Option<&ExecRunRow>) -> String {
     if task.status == ExecTaskStatus::Archived {
         return "⏹ 任务已归档".to_string();
     }
@@ -99,12 +112,20 @@ fn status_line(task: &ExecTask, snap: &LaneSnapshot) -> String {
                 RunStatus::Unknown => "⚠️ 状态待核对（已阻断后续派发）".to_string(),
             }
         }
-        // 无 current：绑定三态（增量 2 文案）——「待初始化」不是损
-        // 坏，损坏是明确失败态（N2）。
-        None => match task.binding {
-            BindingState::Uninitialized => "已登记 · 待初始化".to_string(),
-            BindingState::Bound => "已绑定".to_string(),
-            BindingState::Broken => "⚠️ 绑定损坏".to_string(),
+        // 无 current（重启后 lane 为空）：最近一轮若在启动核对中
+        // 被标 interrupted，如实显示中断（N11/D9）——不凭旧
+        // binding 显示一切正常，也不显示旧队列仍可恢复。
+        None => match latest_run {
+            Some(r) if r.status == "interrupted" => {
+                format!("⚠️ 第 {} 轮已中断（进程重启）· 待核对", r.input_seq)
+            }
+            // 绑定三态（增量 2 文案）——「待初始化」不是损坏，损
+            // 坏是明确失败态（N2）。
+            _ => match task.binding {
+                BindingState::Uninitialized => "已登记 · 待初始化".to_string(),
+                BindingState::Bound => "已绑定".to_string(),
+                BindingState::Broken => "⚠️ 绑定损坏".to_string(),
+            },
         },
     }
 }
@@ -119,6 +140,18 @@ fn result_line(latest: Option<&ExecResultRow>) -> String {
             r.input_seq, r.body_bytes
         )
     })
+}
+
+/// 释放区一行（增量 6，C8/N10）：运行实例空闲释放后如实显示
+/// 「已释放 + 恢复原 Session」——有 current 终态且 released 时；
+/// 释放不删历史、不动队列/暂停。在飞 Run 或新 Run 起跑后不占行。
+fn release_line(snap: &LaneSnapshot) -> String {
+    let show = snap.released && snap.current.as_ref().is_some_and(|r| !r.status.is_live());
+    if show {
+        "- **实例**: 运行实例已释放（下次输入恢复原 Session）\n".to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// 队列区一行（D2 标签保留：进程内受理，重启不保留）。
@@ -260,12 +293,14 @@ mod tests {
             current,
             queued,
             blocked_unknown,
+            released: false,
         }
     }
 
-    /// 无结果行的渲染捷径（既有增量 4 场景与结果区无关）。
+    /// 无结果行/无 Run 事实的渲染捷径（既有增量 4 场景与结果区、
+    /// 中断轮无关）。
     fn render(task: &ExecTask, snap: &LaneSnapshot, gen: i64) -> String {
-        task_card(task, snap, gen, None)
+        task_card(task, snap, gen, None, None)
     }
 
     /// 卡面全部按钮的 callback value（解析整卡 JSON）。
@@ -446,6 +481,7 @@ mod tests {
             &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
             0,
             Some(&row),
+            None,
         );
         assert!(card.contains("第 2 轮结果已保存（1234 字节）"), "{card}");
         assert!(card.contains("📄"), "{card}");
@@ -461,5 +497,94 @@ mod tests {
         );
         assert!(!plain.contains("结果已保存"), "{plain}");
         assert!(!plain.contains("**结果**"), "{plain}");
+    }
+
+    // ── 增量 6：中断轮与释放行（N11/D9/C8/N10）──────────────────
+
+    fn run_row(seq: u64, status: &str) -> ExecRunRow {
+        ExecRunRow {
+            run_id: RunId::new(),
+            task_id: ExecTaskId::new(),
+            input_seq: seq,
+            status: status.to_string(),
+            text: "输入原文".into(),
+            image_keys: vec![],
+            terminal_kind: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn interrupted_latest_run_shows_recheck_instead_of_binding() {
+        // 重启后 lane 无 current：最近一轮被启动核对标 interrupted
+        // → 「已中断 · 待核对」，不凭旧 binding 显示「已绑定」（N11/
+        // D9：不凭旧 running 显示正常）。
+        let interrupted = run_row(3, "interrupted");
+        let card = task_card(
+            &task(BindingState::Bound),
+            &snap(None, 0, false, false),
+            0,
+            None,
+            Some(&interrupted),
+        );
+        assert!(
+            card.contains("⚠️ 第 3 轮已中断（进程重启）· 待核对"),
+            "{card}"
+        );
+        assert!(!card.contains("已绑定"), "{card}");
+        // 队列如实归零且不显示仍可恢复（受理是进程内语义，D2）。
+        assert!(card.contains("已受理待执行 0 条"), "{card}");
+
+        // lane 有 current 时以 lane 为准（事实行不越位）。
+        let running = task_card(
+            &task(BindingState::Bound),
+            &snap(Some(run(4, RunStatus::Running)), 0, false, false),
+            0,
+            None,
+            Some(&interrupted),
+        );
+        assert!(running.contains("执行中 · 第 4 轮"), "{running}");
+        assert!(!running.contains("已中断"), "{running}");
+
+        // 最近一轮正常终态（completed）：回到绑定三态，无中断文案。
+        let completed = run_row(3, "completed");
+        let card = task_card(
+            &task(BindingState::Bound),
+            &snap(None, 0, false, false),
+            0,
+            None,
+            Some(&completed),
+        );
+        assert!(card.contains("已绑定"), "{card}");
+        assert!(!card.contains("已中断"), "{card}");
+    }
+
+    #[test]
+    fn released_line_shows_only_with_terminal_current_and_released() {
+        // current 终态 + released → 「已释放」行（C8/N10：不删历
+        // 史，下次输入恢复原 Session）。
+        let mut s = snap(Some(run(2, RunStatus::Completed)), 0, false, false);
+        s.released = true;
+        let card = render(&task(BindingState::Bound), &s, 0);
+        assert!(
+            card.contains("运行实例已释放（下次输入恢复原 Session）"),
+            "{card}"
+        );
+
+        // released 但 current 在飞 → 不占行（在飞 Run 拥有会话）。
+        let mut s = snap(Some(run(2, RunStatus::Running)), 0, false, false);
+        s.released = true;
+        let card = render(&task(BindingState::Bound), &s, 0);
+        assert!(!card.contains("已释放"), "{card}");
+
+        // 未释放 → 不占行。
+        let card = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
+            0,
+        );
+        assert!(!card.contains("已释放"), "{card}");
     }
 }

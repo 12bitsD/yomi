@@ -54,6 +54,9 @@ async fn harness_with(
         crate::config::ExecConfig {
             max_concurrent_runs: max_runs,
             stop_confirm_timeout_secs: stop_timeout_secs,
+            // 默认测试台：释放阈值拉到 1 小时——既有用例不触发空
+            // 闲释放；释放场景走 `harness_idle`。
+            idle_release_secs: 3600,
         },
     ));
     Harness {
@@ -95,6 +98,7 @@ async fn harness_facts(adapter: SimAdapter) -> Harness {
             crate::config::ExecConfig {
                 max_concurrent_runs: 2,
                 stop_confirm_timeout_secs: 30,
+                idle_release_secs: 3600,
             },
         )
         .with_facts(facts.clone()),
@@ -103,6 +107,78 @@ async fn harness_facts(adapter: SimAdapter) -> Harness {
         sched,
         store,
         adapter,
+        inbox,
+        event_rx,
+        facts: Some(facts),
+    }
+}
+
+/// 增量 6 测试台：任务 store 与事实 store 同库、可调空闲释放阈
+/// 值（秒）。返回 (Harness, 共享 sqlite 池)——池用于搭建「重
+/// 启」形态（同库新 inbox + 新调度器）。
+async fn harness_idle(adapter: SimAdapter, idle_release_secs: u64) -> (Harness, sqlx::SqlitePool) {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+    let store: Arc<dyn ExecTaskStore> = Arc::new(SqliteExecTaskStore::new(pool.clone()));
+    let facts = Arc::new(SqliteExecFactStore::new(pool.clone()));
+    let inbox = ExecInbox::new();
+    let (event_tx, event_rx) = broadcast::channel(256);
+    let adapter = Arc::new(adapter);
+    let sched = Arc::new(
+        ExecScheduler::new(
+            Arc::clone(&store),
+            adapter.clone(),
+            inbox.clone(),
+            event_tx,
+            crate::config::ExecConfig {
+                max_concurrent_runs: 2,
+                stop_confirm_timeout_secs: 30,
+                idle_release_secs,
+            },
+        )
+        .with_facts(facts.clone()),
+    );
+    let h = Harness {
+        sched,
+        store,
+        adapter,
+        inbox,
+        event_rx,
+        facts: Some(facts),
+    };
+    (h, pool)
+}
+
+/// 「重启」形态（增量 6，D9/N11）：同一 sqlite 上的新调度器 +
+/// 全新 inbox（lanes/受理表都是进程内语义，重启清空）；任务登
+/// 记、绑定与 Run 事实跨进程保留。adapter 共享以观察原生身份。
+fn restarted(h: &Harness, pool: &sqlx::SqlitePool) -> Harness {
+    let store: Arc<dyn ExecTaskStore> = Arc::new(SqliteExecTaskStore::new(pool.clone()));
+    let facts = Arc::new(SqliteExecFactStore::new(pool.clone()));
+    let inbox = ExecInbox::new();
+    let (event_tx, event_rx) = broadcast::channel(256);
+    let sched = Arc::new(
+        ExecScheduler::new(
+            Arc::clone(&store),
+            h.adapter.clone(),
+            inbox.clone(),
+            event_tx,
+            crate::config::ExecConfig {
+                max_concurrent_runs: 2,
+                stop_confirm_timeout_secs: 30,
+                idle_release_secs: 3600,
+            },
+        )
+        .with_facts(facts.clone()),
+    );
+    Harness {
+        sched,
+        store,
+        adapter: h.adapter.clone(),
         inbox,
         event_rx,
         facts: Some(facts),
@@ -834,5 +910,300 @@ async fn late_result_belongs_to_its_own_run_and_never_pollutes_current() {
     assert_eq!(
         facts.result_for(&run_b.run_id).await.unwrap().unwrap().body,
         "B 的正文"
+    );
+}
+
+// ══ chat-flow 增量 6：重启核对、重送去重、空闲释放与恢复阻断 ══
+//
+// 设计依据 docs/design/chat-flow-technical-design.md N11/N12/C1/C8/
+// D2/D6/D9 与 docs/design/chat-flow-impl/inc-6-spec.md 测试节。
+
+// ── 规格测试 2：boot_sweep（N11）──────────────────────────────
+
+#[tokio::test]
+async fn boot_sweep_marks_open_runs_interrupted_without_fabricating_terminal() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "b1", &[]).await;
+
+    // 造上一进程生命周期的三种行：running / stopping（未闭合）与
+    // completed（已确认终态）。
+    let mk = |seq: u64, status: RunStatus| RunRecord {
+        run_id: RunId::new(),
+        task_id: task.id.clone(),
+        input_seq: seq,
+        text: format!("输入 {seq}"),
+        image_keys: vec![],
+        status,
+        started_at: Utc::now(),
+        ended_at: None,
+    };
+    let r1 = mk(1, RunStatus::Running);
+    let r2 = mk(2, RunStatus::Stopping);
+    let r3 = mk(3, RunStatus::Completed);
+    facts.run_started(&r1).await.unwrap();
+    facts.run_started(&r2).await.unwrap();
+    facts.run_started(&r3).await.unwrap();
+    let ended = Utc::now();
+    facts
+        .run_terminal(
+            &r3.run_id,
+            RunStatus::Completed,
+            TerminalKind::Completed,
+            ended,
+        )
+        .await
+        .unwrap();
+
+    // sweep：未闭合行标 interrupted，计数如实；终态行不动；不伪
+    // 造终态（kind/ended_at 留 NULL）。
+    let marked = h.sched.boot_sweep().await.unwrap();
+    assert_eq!(marked, 2, "running + stopping marked");
+    let rows = facts.runs_for(&task.id).await.unwrap();
+    assert_eq!(rows[0].status, "interrupted");
+    assert_eq!(rows[1].status, "interrupted");
+    for r in &rows[..2] {
+        assert_eq!(r.terminal_kind, None, "中断不伪造终态种类");
+        assert_eq!(r.ended_at, None, "中断不伪造结束时刻");
+    }
+    assert_eq!(rows[2].status, "completed", "终态行不动");
+    assert_eq!(rows[2].terminal_kind.as_deref(), Some("completed"));
+    assert_eq!(rows[2].ended_at, Some(ended));
+
+    // 幂等：再扫无行可标（interrupted 不在未闭合集合内）。
+    assert_eq!(h.sched.boot_sweep().await.unwrap(), 0);
+}
+
+// ── 受理「是否开始」（N12 派发侧接线）─────────────────────────
+
+#[tokio::test]
+async fn acceptance_marks_started_on_native_ack() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "a1", &["A"]).await;
+    assert!(facts
+        .record_acceptance("test", "a1-m0", &task.id)
+        .await
+        .unwrap());
+
+    // 原生确认开始 → 凭据「已开始」（重启后重送据此回答「已开始
+    // 执行，不重复执行」而非「未恢复」）。
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let acc = facts
+        .acceptance_for("test", "a1-m0")
+        .await
+        .unwrap()
+        .expect("acceptance persisted");
+    assert!(acc.started);
+}
+
+// ── 规格测试 3：D9 主动恢复（绑定持久化，新输入恢复原 Session）──
+
+#[tokio::test]
+async fn restart_new_input_resumes_bound_session_with_same_native_id() {
+    let (h, pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "d9", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+
+    // 「重启」：新调度器 + 全新 inbox，同 sqlite——任务登记、绑
+    // 定与 Run 事实跨进程保留；lane 与受理表是进程内语义（D2）。
+    let h2 = restarted(&h, &pool);
+    // 用户主动新输入 → 受理（凭据持久化，镜像 handlers 流程）→
+    // 派发走 Bound 分支用原 native id（D9：恢复原 Session）。
+    let outcome = h2.inbox.accept(&task.id, "d9-m-new", "ou_t", "B", vec![]);
+    assert!(matches!(outcome, AcceptOutcome::Accepted { .. }));
+    assert!(facts
+        .record_acceptance("test", "d9-m-new", &task.id)
+        .await
+        .unwrap());
+    assert!(h2.sched.try_dispatch(&task.id).await.unwrap());
+
+    // native id 不变、新 Run 行、binding 不动、不新建原生会话。
+    let started = h2.adapter.started_runs();
+    assert_eq!(started.len(), 2);
+    assert_eq!(started[1].0, native, "resumed with the same native id");
+    assert_eq!(started[1].1.text, "B");
+    assert_eq!(
+        h2.adapter.created_sessions().len(),
+        1,
+        "no new native session created"
+    );
+    let bound = h2.store.get(&task.id).await.unwrap().unwrap();
+    assert_eq!(bound.binding, BindingState::Bound, "binding 不动");
+    assert_eq!(bound.provider_session_id.as_deref(), Some(native.as_str()));
+    let runs = facts.runs_for(&task.id).await.unwrap();
+    assert_eq!(runs.len(), 2, "new run fact row");
+    assert!(runs.iter().any(|r| r.text == "B" && r.status == "running"));
+    let snap = h2.sched.snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| (r.status, r.text.as_str())),
+        Some((RunStatus::Running, "B"))
+    );
+}
+
+// ── 规格测试 4：空闲释放（C8/N10）──────────────────────────────
+
+#[tokio::test]
+async fn idle_release_after_terminal_fires_once_and_resume_reuses_native_id() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 1).await;
+    let task = make_task(&h, "r1", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+
+    // 终态（事实已写）后无立即可派项 → 到点释放恰好一次。
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+    wait_until("idle release fires", || {
+        h.adapter.released_sessions().len() == 1
+    })
+    .await;
+    assert_eq!(h.adapter.released_sessions(), vec![native.clone()]);
+    assert!(h.sched.snapshot(&task.id).released, "lane 标 released");
+    // 不多放：静默期后仍是一次（不多发、不重试）。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.adapter.released_sessions().len(), 1);
+
+    // 卡面凭据：current 终态 + released；队列/暂停不动。
+    let snap = h.sched.snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(RunStatus::Completed)
+    );
+    assert!(!snap.paused);
+
+    // 释放后新输入 → 同 native id 恢复派发（恢复原 Session，
+    // D9）；released 标志随起跑清除，派发本身不触发释放。
+    h.inbox.accept(&task.id, "r1-m1", "ou_t", "B", vec![]);
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let started = h.adapter.started_runs();
+    assert_eq!(started.len(), 2);
+    assert_eq!(started[1].0, native, "resume with the same native id");
+    assert_eq!(started[1].1.text, "B");
+    assert!(!h.sched.snapshot(&task.id).released);
+    assert_eq!(h.adapter.released_sessions().len(), 1);
+}
+
+#[tokio::test]
+async fn idle_release_with_paused_queue_keeps_inbox_and_pause() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 1).await;
+    let task = make_task(&h, "r2", &["A", "B"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+
+    // 停止并暂停（队列仍有 B）→ cancel 确认 → 终态。
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+    h.sched
+        .stop_and_pause(&task.id, Some(run_a.run_id.clone()))
+        .await;
+    h.sched.terminal(&native, TerminalKind::Cancelled).await;
+    assert!(h.sched.snapshot(&task.id).paused);
+    assert_eq!(queue_texts(&h, &task.id), vec!["B"]);
+
+    // 暂停且有 B 等待同样释放（C8/N10）；yomi 队列/暂停不动——
+    // 释放不消费队列、不解暂停、不发事件伪造状态。
+    wait_until("release fires with paused queue", || {
+        !h.adapter.released_sessions().is_empty()
+    })
+    .await;
+    assert_eq!(h.adapter.released_sessions(), vec![native.clone()]);
+    let snap = h.sched.snapshot(&task.id);
+    assert!(snap.paused, "release does not unpause");
+    assert!(snap.released);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(RunStatus::Stopped)
+    );
+    assert_eq!(
+        queue_texts(&h, &task.id),
+        vec!["B"],
+        "release does not consume the queue"
+    );
+
+    // 明确恢复后继续 B：同 native id（恢复原 Session，D9）。
+    let outcome = h.sched.resume(&task.id).await;
+    assert!(matches!(
+        outcome,
+        ResumeOutcome::Resumed { dispatched: true }
+    ));
+    let started = h.adapter.started_runs();
+    assert_eq!(started.last().unwrap().0, native);
+    assert_eq!(started.last().unwrap().1.text, "B");
+    assert!(!h.sched.snapshot(&task.id).released);
+}
+
+#[tokio::test]
+async fn idle_release_timer_is_cancelled_by_lane_activity() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 1).await;
+    let task = make_task(&h, "r3", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+
+    // 终态 → 计时武装；停止动作（lane 活动）→ 到点不释放。
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+    h.sched.stop_and_pause(&task.id, None).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        h.adapter.released_sessions().is_empty(),
+        "stop cancels the armed release timer"
+    );
+    assert!(!h.sched.snapshot(&task.id).released);
+
+    // 恢复（空队列，dispatched=false）同样是 lane 活动；释放计时
+    // 只在终态武装——无后续终态即不释放。
+    let outcome = h.sched.resume(&task.id).await;
+    assert!(matches!(
+        outcome,
+        ResumeOutcome::Resumed { dispatched: false }
+    ));
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(h.adapter.released_sessions().is_empty());
+}
+
+// ── 规格测试 5：历史缺失（D6：恢复失败如实阻断）────────────────
+
+#[tokio::test]
+async fn resume_failure_marks_unknown_blocked_and_keeps_binding() {
+    let (h, pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "h6", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+
+    // D6 历史缺失：Bound 原生身份的历史不可用（resume_fails 武
+    // 装）——恢复失败如实报错，不静默新建 Session。
+    h.adapter.control().fail_resume(&native);
+
+    // 「重启」后用户主动新输入 → Bound 分支 start_run 报错 →
+    // Unknown + blocked_unknown（现有路径：不跳过输入、不自动重
+    // 建、卡面待核对）。
+    let h2 = restarted(&h, &pool);
+    h2.inbox.accept(&task.id, "h6-m-new", "ou_t", "B", vec![]);
+    assert!(facts
+        .record_acceptance("test", "h6-m-new", &task.id)
+        .await
+        .unwrap());
+    assert!(!h2.sched.try_dispatch(&task.id).await.unwrap());
+
+    let snap = h2.sched.snapshot(&task.id);
+    assert!(snap.blocked_unknown, "卡面显示「待核对」的凭据");
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(RunStatus::Unknown)
+    );
+    assert_eq!(
+        queue_texts(&h2, &task.id),
+        vec!["B"],
+        "输入保留在队首不跳过（N3）"
+    );
+    let bound = h2.store.get(&task.id).await.unwrap().unwrap();
+    assert_eq!(bound.binding, BindingState::Bound, "binding 不变");
+    assert_eq!(bound.provider_session_id.as_deref(), Some(native.as_str()));
+    assert_eq!(
+        h2.adapter.created_sessions().len(),
+        1,
+        "无新 native id（不自动重建，N2/D6）"
     );
 }

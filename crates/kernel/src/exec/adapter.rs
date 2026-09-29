@@ -4,8 +4,14 @@
 //! - C4：准备会话返回可持久绑定的原生身份；提交新一轮区分未发送/
 //!   可能已发送/原生已确认开始；停止先报受理、再报原生终态——
 //!   终态经 [`ExecAdapterSink`] 回调进入调度器，不在调用返回里
-//!   冒充；
+//!   冒充；释放按固定版本核实持久化边界，关闭资源不删除历史；
 //! - N2：原生身份必须可持久绑定，恢复时使用原身份，失败不替换。
+//!
+//! 增量 6 追加（C8/N10/D6）：
+//! - `release`：空闲释放运行实例——不删历史、不影响别的任务；
+//!   恢复是调用方用原身份 `start_run`（sim 即同 id 恢复）；
+//! - Sim `resume_fails` 旋钮：Bound 原生身份历史不可用的如实阻
+//!   断场景（D6——恢复失败不静默新建）。
 //!
 //! P1 全程只有 [`SimAdapter`]（标注：P3 由真实双 Provider adapter
 //! 替换）；生产装配默认挂起模式——无真实 Provider 时不伪造进展。
@@ -88,6 +94,11 @@ pub trait ExecAdapter: Send + Sync {
     /// 请求取消。返回 Ok = 停止请求已受理（≠已停止）；原生终态
     /// 经 sink 异步上报（C6）。
     async fn cancel(&self, native_session_id: &str) -> Result<()>;
+
+    /// 空闲释放运行实例（增量 6，C8/N10）：关闭资源不删除历史、
+    /// 不影响别的任务；恢复由调用方用原身份 `start_run`（原生侧
+    /// load/resume，sim 即同 id `start_run`）。
+    async fn release(&self, native_session_id: &str) -> Result<()>;
 }
 
 /// `SimAdapter` 的共享控制柄（chat-flow 增量 4，Arc 共享、clone
@@ -106,6 +117,11 @@ pub struct SimControl {
     auto_complete: Arc<Mutex<Option<Duration>>>,
     /// cancel 观察口（与 adapter 共享；停止幂等性断言用）
     cancelled: Arc<Mutex<Vec<String>>>,
+    /// 恢复失败旋钮（增量 6，D6 历史缺失场景）：集合内的原生身份
+    /// `start_run` 一律报错——模拟「Bound 的原生 Session 历史不可
+    /// 用」，走 Unknown + `blocked_unknown` 如实阻断路径（不静默新
+    /// 建 Session）。
+    resume_fails: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl SimControl {
@@ -142,6 +158,16 @@ impl SimControl {
         self.cancelled.lock().unwrap().clone()
     }
 
+    /// 让某原生身份的 `start_run` 失败（增量 6：Bound 历史缺失的
+    /// 恢复失败场景，D6）。武装后一直生效（与真实「历史不可用」
+    /// 同义——不是一次性抖动）。
+    pub fn fail_resume(&self, native_session_id: &str) {
+        self.resume_fails
+            .lock()
+            .unwrap()
+            .insert(native_session_id.to_string());
+    }
+
     fn report(&self, native_session_id: &str, kind: TerminalKind) {
         if let Some(sink) = &self.sink {
             sink.terminal(native_session_id, kind);
@@ -167,6 +193,9 @@ pub struct SimAdapter {
     created: Mutex<Vec<String>>,
     /// 测试观察口：`start_run` 收到的（原生身份, 输入）（按序）
     started: Mutex<Vec<(String, AcceptedInput)>>,
+    /// 测试观察口：`release` 收到的原生身份（按序；增量 6 空闲释
+    /// 放——记录调用即释放，历史不动）
+    released: Mutex<Vec<String>>,
     /// 增量 4：共享控制柄（自动完成旋钮 + cancel 观察口 + 终态注
     /// 入口的共享副本——见 [`SimControl`]）
     control: SimControl,
@@ -181,6 +210,7 @@ impl Default for SimAdapter {
             fail_next_start: AtomicBool::new(false),
             created: Mutex::new(Vec::new()),
             started: Mutex::new(Vec::new()),
+            released: Mutex::new(Vec::new()),
             control: SimControl::default(),
         }
     }
@@ -227,6 +257,11 @@ impl SimAdapter {
         self.started.lock().unwrap().clone()
     }
 
+    /// 测试观察口：已收到的 `release`（原生身份, 按序）。
+    pub fn released_sessions(&self) -> Vec<String> {
+        self.released.lock().unwrap().clone()
+    }
+
     /// 测试观察口：已收到的 cancel。
     pub fn cancelled_sessions(&self) -> Vec<String> {
         self.control.cancelled_sessions()
@@ -251,6 +286,19 @@ impl ExecAdapter for SimAdapter {
         if self.fail_next_start.swap(false, Ordering::AcqRel) {
             return Err(crate::types::KernelError::task(
                 "sim adapter: start_run failed (fail_next_start armed)",
+            ));
+        }
+        // D6 历史缺失旋钮：Bound 身份恢复失败如实报错（不替换身份、
+        // 不静默新建）。
+        if self
+            .control
+            .resume_fails
+            .lock()
+            .unwrap()
+            .contains(native_session_id)
+        {
+            return Err(crate::types::KernelError::task(
+                "sim adapter: native session history unavailable (resume_fails armed)",
             ));
         }
         self.started
@@ -281,6 +329,16 @@ impl ExecAdapter for SimAdapter {
                 sink.terminal(native_session_id, TerminalKind::Cancelled);
             }
         }
+        Ok(())
+    }
+
+    async fn release(&self, native_session_id: &str) -> Result<()> {
+        // sim：记录调用即释放（C8：关闭资源不删除历史——恢复是同
+        // 一身份的 start_run，不走 create_session）。
+        self.released
+            .lock()
+            .unwrap()
+            .push(native_session_id.to_string());
         Ok(())
     }
 }

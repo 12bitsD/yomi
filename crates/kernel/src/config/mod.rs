@@ -240,7 +240,8 @@ impl Default for GcConfig {
 ///
 /// 设计依据 docs/design/chat-flow-technical-design.md N3/C3：并发名额
 /// 是部署参数，统一分配、轮次间公平、不抢占当前 Run；停止确认超时
-/// 是 N6/C6「停止中≠已停止」的升级阈值。
+/// 是 N6/C6「停止中≠已停止」的升级阈值。增量 6 追加空闲释放阈值
+/// （C8/N10）。
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ExecConfig {
@@ -249,6 +250,10 @@ pub struct ExecConfig {
     /// 停止确认超时（秒）：cancel 受理后超时不报原生终态 → 标记
     /// `StopUnconfirmed` 并保留 Stopping（未确认，继续禁写）
     pub stop_confirm_timeout_secs: u64,
+    /// 空闲释放阈值（秒，C8/N10）：终态事实写定且无立即可派项后，
+    /// 运行实例空闲超过本阈值即释放——不删历史、不动队列/暂停状
+    /// 态（暂停且有等待项同样释放）；下次输入用原 Session 恢复。
+    pub idle_release_secs: u64,
 }
 
 impl Default for ExecConfig {
@@ -256,6 +261,7 @@ impl Default for ExecConfig {
         Self {
             max_concurrent_runs: 2,
             stop_confirm_timeout_secs: 30,
+            idle_release_secs: 60,
         }
     }
 }

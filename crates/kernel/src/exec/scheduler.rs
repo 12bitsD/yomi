@@ -25,6 +25,18 @@
 //! - `save_result` 成功（首次保存）才发 `ResultPublished` 并触发
 //!   卡面刷新——先保存再公布（N9）。
 //!
+//! 增量 6 追加（N11/N12/C8/N10/D9）：
+//! - 启动核对 `boot_sweep`（N11/D9）：上一进程生命周期未闭合的
+//!   Run 如实标 `interrupted`——不伪造终态、不凭旧 running 显示
+//!   正常、绝不自动重跑；
+//! - 受理「是否开始」（N12）：原生确认开始（含 Starting 中终态
+//!   消费）即 `mark_started`——重启后重送据此区分「曾等待」与
+//!   「已派发」，两种都绝不重新执行；
+//! - 空闲释放（C8/N10）：终态事实写定且无在飞 Run → per-lane 释
+//!   放计时；暂停且有等待项同样释放（yomi 队列/暂停不动）；计
+//!   时被任何 lane 状态变化打断；释放不消费队列、不解暂停、不
+//!   发事件伪造状态——恢复是下次派发用原 native id（D9）。
+//!
 //! 事件（`ExecEvent`，tokio broadcast）只是提示（hint）——状态唯
 //! 一事实源是 lane 锁内字段（增量 4 卡面据此刷新，不据事件推断）。
 
@@ -117,6 +129,9 @@ pub struct LaneSnapshot {
     pub current: Option<RunRecord>,
     pub queued: usize,
     pub blocked_unknown: bool,
+    /// 运行实例已释放（增量 6，C8/N10）：历史/队列/暂停不动，下
+    /// 次输入用原 Session 恢复——卡面「已释放」行的凭据。
+    pub released: bool,
 }
 
 /// 每卡控制 lane（N6 唯一裁定者）。`std::sync::Mutex`：全部判定
@@ -141,6 +156,21 @@ struct TaskLane {
     cancel_issued: bool,
     /// `StopUnconfirmed` 是否已标记（一次性，避免每次 sweep 重报）
     unconfirmed_notified: bool,
+    /// lane 活动代次（增量 6，C8/N10 空闲释放的打断凭据）：任何
+    /// lane 状态变化（Starting 占位/终态提交/暂停/恢复）+1；释放
+    /// 计时到点重核代次，不匹配即放弃——不释放有活动的 lane。
+    activity_epoch: u64,
+    /// 运行实例已释放（增量 6）：释放不删历史、不动队列/暂停；
+    /// `native_session_id` 保留——恢复是下次派发用原 id（sim 即
+    /// 同 id `start_run`）。
+    released: bool,
+}
+
+impl TaskLane {
+    /// 记录一次 lane 状态变化（打断在飞的空闲释放计时）。
+    fn note_activity(&mut self) {
+        self.activity_epoch = self.activity_epoch.wrapping_add(1);
+    }
 }
 
 /// 执行调度器（每卡 lane + 全局名额）。
@@ -154,6 +184,8 @@ pub struct ExecScheduler {
     event_tx: broadcast::Sender<ExecEvent>,
     /// 停止确认超时（`exec.stop_confirm_timeout_secs`）
     stop_confirm_timeout: Duration,
+    /// 空闲释放阈值（`exec.idle_release_secs`，增量 6，C8/N10）
+    idle_release: Duration,
     /// Run 事实 + 结果正文持久化（增量 5，N7/N9；None = 纯内存测
     /// 试台——事实写入整体关闭，行为与增量 3/4 一致）
     facts: Option<Arc<dyn ExecFactStore>>,
@@ -176,6 +208,7 @@ impl ExecScheduler {
             inbox,
             event_tx,
             stop_confirm_timeout: Duration::from_secs(config.stop_confirm_timeout_secs),
+            idle_release: Duration::from_secs(config.idle_release_secs),
             facts: None,
         }
     }
@@ -195,6 +228,78 @@ impl ExecScheduler {
     /// 周期 sweep 的建议间隔（超时的一半，钳 1–30s；Kernel 装配用）。
     pub fn sweep_interval(&self) -> Duration {
         Duration::from_secs((self.stop_confirm_timeout.as_secs() / 2).clamp(1, 30))
+    }
+
+    /// 启动核对（增量 6，N11/D9）：上一进程生命周期未闭合的 Run
+    /// （starting/running/stopping）如实标 `interrupted`——中断是
+    /// 事实状态，不伪造终态（`terminal_kind`/`ended_at` 留
+    /// NULL），不凭旧 running 显示正常，绝不自动重跑。
+    /// `Kernel::new` 装配后调用一次；返回标记行数（无 facts 的纯
+    /// 内存台恒 0）。
+    pub async fn boot_sweep(&self) -> Result<u64> {
+        let Some(facts) = &self.facts else {
+            return Ok(0);
+        };
+        let n = facts.mark_interrupted_open_runs().await?;
+        if n > 0 {
+            tracing::warn!(
+                n,
+                "exec boot sweep: open runs from a previous process lifetime marked interrupted (never re-executed)"
+            );
+        } else {
+            tracing::info!("exec boot sweep: no open runs from previous lifetimes");
+        }
+        Ok(n)
+    }
+
+    /// 空闲释放计时（增量 6，C8/N10）：terminal 落定且 lane 无在
+    /// 飞 Run 后武装。到点重核活动代次——期间任何 lane 状态变化
+    /// （新派发/停止/恢复/终态）都已 bump 代次，不匹配即放弃；
+    /// 释放只关闭运行实例：不消费队列、不解暂停、不发事件伪造
+    /// 状态；`native_session_id` 保留（恢复用原 id）。
+    fn arm_idle_release(&self, task_id: &ExecTaskId, lane: &Arc<Mutex<TaskLane>>) {
+        let epoch = lane.lock().unwrap().activity_epoch;
+        let adapter = Arc::clone(&self.adapter);
+        let lane = Arc::clone(lane);
+        let task_id = task_id.clone();
+        let delay = self.idle_release;
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let native = {
+                let g = lane.lock().unwrap();
+                let idle = g.activity_epoch == epoch
+                    && !g.released
+                    && !g.current.as_ref().is_some_and(|r| r.status.is_live());
+                if idle {
+                    g.native_session_id.clone()
+                } else {
+                    None
+                }
+            };
+            let Some(native) = native else {
+                return;
+            };
+            if let Err(e) = adapter.release(&native).await {
+                // 释放失败只 warn：实例原样保留（不谎称已释放）；下
+                // 次终态自然再武装。
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "exec idle release failed; instance left as-is"
+                );
+                return;
+            }
+            // 标记前再核代次：释放等待期间起跑的新 Run 拥有会话，
+            // 不标 released（释放与起跑竞态按「恢复」语义兼容）。
+            let mut g = lane.lock().unwrap();
+            if g.activity_epoch == epoch {
+                g.released = true;
+                tracing::info!(
+                    task_id = %task_id,
+                    "exec idle release: native instance released (history kept; next input resumes the same session)"
+                );
+            }
+        });
     }
 
     /// adapter 回调泵：sink 上报逐条转 `terminal` / `result_reported`
@@ -383,6 +488,10 @@ impl ExecScheduler {
             g.permit = Some(permit);
             g.cancel_issued = false;
             g.unconfirmed_notified = false;
+            // 取得资格 = lane 状态变化（打断空闲释放计时）；新 Run
+            // 拥有原生会话——released 标志随起跑清除（恢复已发生）。
+            g.released = false;
+            g.note_activity();
             (input, run)
         };
 
@@ -482,6 +591,17 @@ impl ExecScheduler {
                     // 只 warn——不阻断已确认的运行，查询面如实反映
                     // 缺失（lane 快照仍是状态唯一事实源）。
                     if let Some(facts) = &self.facts {
+                        // 增量 6（N12）：原生确认开始 = 受理「已开
+                        // 始」——重启后重送据此如实回答「已开始执
+                        // 行，不重复执行」而非「未恢复」。
+                        if let Err(e) = facts.mark_started(&task.channel_name, &input.msg_id).await
+                        {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "exec acceptance mark_started failed; run continues"
+                            );
+                        }
                         let mut rec = run.clone();
                         rec.status = lane
                             .lock()
@@ -545,7 +665,7 @@ impl ExecScheduler {
             return;
         };
         // 终态事实写入载荷（锁内提交时捕获，锁外写 store）。
-        let terminal_fact = {
+        let (terminal_fact, starting_consumed) = {
             let mut g = lane.lock().unwrap();
             let Some(cur) = g.current.as_mut() else {
                 tracing::warn!(
@@ -567,9 +687,9 @@ impl ExecScheduler {
             }
             // Starting 中到达的终态同样消费输入（adapter 契约：先
             // ack 后报终态——ack 即输入已交原生侧）。
-            if cur.status == RunStatus::Starting {
-                self.inbox.pop_front(&task_id);
-            }
+            let consumed = (cur.status == RunStatus::Starting)
+                .then(|| self.inbox.pop_front(&task_id))
+                .flatten();
             cur.status = match kind {
                 TerminalKind::Completed => RunStatus::Completed,
                 TerminalKind::Failed => RunStatus::Failed,
@@ -580,12 +700,14 @@ impl ExecScheduler {
             let fact = cur.clone();
             g.permit = None; // 释放名额
             g.stop_requested_at = None;
+            // 终态提交 = lane 状态变化（打断在飞的空闲释放计时）。
+            g.note_activity();
             let _ = self.event_tx.send(ExecEvent::RunTerminal {
                 task_id: task_id.clone(),
                 run_id,
                 kind,
             });
-            fact
+            (fact, consumed)
         };
         // 增量 5（N7）：终态事实持久化。先 run_started（INSERT OR
         // IGNORE 幂等）再 run_terminal——泵与 try_dispatch 并发时
@@ -613,6 +735,37 @@ impl ExecScheduler {
                     "exec run terminal fact write failed; scheduler state unaffected"
                 );
             }
+            // 增量 6（N12）：Starting 中终态消费的输入同样「已开
+            // 始」——与 try_dispatch 的标记同一语义（ack 即输入已
+            // 交原生侧）。lane 不存通道名，经任务登记取（罕见路
+            // 径，读一次）。
+            if let Some(input) = starting_consumed {
+                match self.store.get(&task_id).await {
+                    Ok(Some(task)) => {
+                        if let Err(e) = facts.mark_started(&task.channel_name, &input.msg_id).await
+                        {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                error = %e,
+                                "exec acceptance mark_started on terminal failed"
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            "exec acceptance mark_started: task gone; skipped"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            task_id = %task_id,
+                            error = %e,
+                            "exec acceptance mark_started: task lookup failed"
+                        );
+                    }
+                }
+            }
         }
         // 终态后重试派发：本卡（!paused && !blocked 时业务失败也
         // 继续，N3）与可能因名额等待的他卡（名额刚释放；各 lane
@@ -622,6 +775,20 @@ impl ExecScheduler {
             if let Err(e) = self.try_dispatch(&id).await {
                 tracing::warn!(task_id = %id, error = %e, "exec post-terminal redispatch failed");
             }
+        }
+        // 增量 6（C8/N10）：重试后 lane 仍无在飞 Run → 武装空闲释
+        // 放计时。暂停且有 B/C 等待同样释放（yomi 队列/暂停不
+        // 动）；`blocked_unknown` 不释放——原生侧可能仍在运行
+        // （与名额保留同一道理）；计时被任何 lane 状态变化打断。
+        let arm = {
+            let g = lane.lock().unwrap();
+            !g.blocked_unknown
+                && !g.released
+                && !g.current.as_ref().is_some_and(|r| r.status.is_live())
+                && g.native_session_id.is_some()
+        };
+        if arm {
+            self.arm_idle_release(&task_id, &lane);
         }
     }
 
@@ -651,6 +818,9 @@ impl ExecScheduler {
                     task_id: task_id.clone(),
                 });
             }
+            // 停止动作 = lane 状态变化（打断空闲释放计时——停止动
+            // 作期间不释放，C8/N10）。
+            g.note_activity();
             match g.current.as_ref().filter(|r| r.status.is_live()) {
                 None => Act::NoCurrent,
                 Some(cur) => {
@@ -716,6 +886,8 @@ impl ExecScheduler {
             {
                 return ResumeOutcome::BlockedStopUnconfirmed;
             }
+            // 恢复动作 = lane 状态变化（打断空闲释放计时）。
+            g.note_activity();
             if g.paused {
                 g.paused = false;
                 let _ = self.event_tx.send(ExecEvent::Resumed {
@@ -773,6 +945,7 @@ impl ExecScheduler {
             current: g.current.clone(),
             queued: self.inbox.len(task_id),
             blocked_unknown: g.blocked_unknown,
+            released: g.released,
         }
     }
 

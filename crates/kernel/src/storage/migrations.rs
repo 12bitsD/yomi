@@ -8,7 +8,7 @@ use sqlx::sqlite::SqlitePool;
 use tracing::{info, warn};
 
 /// Current schema version - bump this when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 27;
+pub const CURRENT_SCHEMA_VERSION: i64 = 28;
 
 /// A single database migration (can contain multiple SQL statements)
 struct Migration {
@@ -382,6 +382,24 @@ const MIGRATIONS: &[Migration] = &[
             );",
             r"CREATE INDEX idx_exec_results_task ON exec_results(task_id, input_seq);",
         ],
+    },
+    Migration {
+        version: 28,
+        // chat-flow W2 增量 6：受理凭据持久化（C1/N12，设计依据
+        // docs/design/chat-flow-technical-design.md N12「记录收到什
+        // 么、是否开始」）。重启后旧输入重送可区分「上一进程生命周
+        // 期受理过」并明确拒绝重排队/重执行；`started` 记录该输入
+        // 是否已被派发（N12「是否开始」）。这是最小去重账本，不是
+        // 待执行队列持久化——绝不用于重放旧输入（D2/D9）。
+        name: "add_exec_acceptance",
+        sqls: &[r"CREATE TABLE exec_acceptance (
+                channel_name TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                task_id TEXT NOT NULL REFERENCES exec_tasks(id),
+                accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (channel_name, msg_id)
+            );"],
     },
 ];
 

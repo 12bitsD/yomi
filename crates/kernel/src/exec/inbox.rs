@@ -116,6 +116,19 @@ impl ExecInbox {
             .and_then(|mut e| e.queue.pop_front())
     }
 
+    /// 撤回队中指定输入（增量 6，C1/N12：受理凭据核对不通过的回
+    /// 滚——凭据已在但本进程 inbox 无此条 = 上一进程生命周期受理
+    /// 过，刚入队的输入必须撤回，不重新入队、不派发）。去重记忆
+    /// 与序号水位保留：本进程内后续重送仍是 Duplicate（受理是一
+    /// 次性事实，撤回不等于未受理）。返回是否真的移除了排队项。
+    pub fn remove_queued(&self, task_id: &ExecTaskId, msg_id: &str) -> bool {
+        self.inner.get_mut(task_id).is_some_and(|mut e| {
+            let before = e.queue.len();
+            e.queue.retain(|i| i.msg_id != msg_id);
+            e.queue.len() != before
+        })
+    }
+
     #[cfg(test)]
     pub fn is_empty(&self, task_id: &ExecTaskId) -> bool {
         self.len(task_id) == 0

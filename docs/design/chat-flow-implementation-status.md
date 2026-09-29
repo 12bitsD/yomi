@@ -79,7 +79,22 @@
 - 验收（主 agent 独立复跑）：`cargo test -p kernel exec::` 25/25 过（9 场景映射见 inc-3-spec 与 scheduler_test）；feature 三组合 check 过（`--no-default-features` 1 个 dead_code 警告为基线存量 ef1ec657，非本次）；clippy 零新增；fmt 过。
 - 偏差（实施方记录，主 agent 复核认可）：场景 9（开关）置 taskflow_test（需 hub MockAdapter 测试台）；start 失败留 Unknown 且名额不释放（防超发）；RunMismatch 保持 paused（先暂停后核对）。
 
-### 增量 4：卡面控制（按钮/回调/事件刷新）—— 设计中
+### 增量 4：卡面控制（按钮/回调/事件刷新）—— ✅ 已验收（commit `c4011b32`），**P2 收口**
+
+- 过程备注：实施 agent 中途被主人取消（两次），代码已基本写完；主 agent 直接接手验收——独立跑全量（1772 过/4 已知沙箱失败）、taskflow 16/16（含新增 6 场景）、clippy 零新增、fmt 过，逐文件审 diff 后提交。
+- 改动：`cards/taskcard.rs` 改快照渲染（各状态如实区分，无合法操作不出按钮）；`taskcard/mod.rs` 加 `handle_exec_action`（C9 逐维重核：字段→开关→任务→代次→Run）；`taskcard/relay.rs` 事件驱动刷新（per-task 串行锁内重读快照渲染，事件只是提示；PATCH 失败只 warn；无卡不补）；`SimControl` 测试柄；hub `exec_` 前缀臂；分流臂受理后统一走快照刷新。
+- 主人交代事项：git stash 已查——`git stash list` 为空（增量 2 验收时的 stash 当场 pop 干净）；fsck 的 dangling commits 是 stash/pop 残留，无害，随 gc 清理。
+
+## P4：事实、结果与只读查询
+
+### 增量 5：Run 事实/结果/只读查询（W2 内核）—— ✅ 已验收（commit `934e6a71`）
+
+- 改动：migration v27（`exec_runs`/`exec_results`）、`exec/facts.rs`（503 行，insert-once/终态单向）、scheduler 事实钩子 + 结果上报收口（`AdapterNotice::Terminal/Result` 枚举泵）、卡面结果行经 relay 锁内读取、`tools/task_status.rs`（665 行，task_status 双形态 + task_result 按轮读，严格只读）。
+- 验收（主 agent 独立复跑）：exec 29/29、task_status 3/3、facts_flow 1/1；全量 1779–1780 过、4 已知沙箱失败（hook 测试负载下偶发 flake 为第 5 个波动源，单跑过、基线同现）；clippy 65=基线；fmt 过。
+- **已知待硬化（P3 协议层，记入下游集成要求）**：结果上报通道只带 native 身份，当前归属=「单 writer 轮序下最早无正文 Run」。某轮合法无正文（如无报告的失败轮）时，下一轮正文会被错配到该轮。正解=真实 adapter 上报必须回显 start_run 授予的 run 身份（C4「上报属于该轮的正文」的协议化）。
+- 偏差（实施方记录，主 agent 复核认可）：`list_tasks_with_activity` 取 `Option<&str>`；`terminal()` 先补 `run_started`（INSERT OR IGNORE）消泵/派发写竞态；测试环境缺 libssl 开发符号链接，实施方用 `~/.local/lib/ssl-dev-shim` 用户级 shim 未动系统。
+
+### P6（重启与故障契约）—— 下一个增量
 
 ## 未验证项与所需条件（滚动清单）
 

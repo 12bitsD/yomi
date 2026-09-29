@@ -52,22 +52,30 @@ pub(crate) async fn handle_incoming_message(
         "session mapping"
     );
 
-    // ── 任务 Thread 分流（chat-flow N1/C1）──────────────────────
+    // ── 任务 Thread 分流（chat-flow N1/C1/N12）───────────────────
     // 命中任务 Thread 的普通消息确定性分流到任务受理：绝不进入 chat
     // 路径（不 prepare_trigger、不 steer、不建 chat session）。slash
     // 命令在任务 Thread 内不分流、保持旧语义（`/task` 由其命令臂拒
     // 绝嵌套）；未命中任务的 Thread 消息原逻辑零改动。
-    // R7 开关（增量 3）：通道 `exec_tasks=false` → 分流关闭，落回
-    // 原 chat 路径。
-    if matches!(cmd, ChannelCommand::None) && config.exec_tasks {
+    // R7 开关（增量 6 语义修正，N12/P6）：先查任务命中再看开关——
+    // 命中任务但 `exec_tasks=false` → 明确拒收（任务保留，输入未
+    // 受理，不掉回普通 Chat）；「落回 chat 路径」仅适用于未命中任
+    // 务的消息。
+    if matches!(cmd, ChannelCommand::None) {
         if let Some(task) = task_thread_hit(&kernel, adapter, channel_name, &msg).await? {
+            if !config.exec_tasks {
+                return Ok(Some(
+                    "⛔ 本通道已关闭执行任务功能；任务保留，输入未受理。".to_string(),
+                ));
+            }
             // 归档不删历史，也不再受理新输入（D8）。
             if task.status == ExecTaskStatus::Archived {
                 return Ok(Some("⏹ 任务已归档，不接受新输入。".to_string()));
             }
+            let msg_id = msg.external_message_id.clone().unwrap_or_default();
             let outcome = kernel.exec_inbox().accept(
                 &task.id,
-                msg.external_message_id.clone().unwrap_or_default(),
+                msg_id.clone(),
                 msg.external_user_id.clone(),
                 msg.raw_text.clone().unwrap_or_default(),
                 msg.image_keys.clone(),
@@ -77,6 +85,41 @@ pub(crate) async fn handle_incoming_message(
                 // 生任何可见动作。
                 AcceptOutcome::Duplicate => return Ok(None),
                 AcceptOutcome::Accepted { .. } => {
+                    // C1 完整语义（增量 6，N12）：受理凭据持久化。
+                    // 凭据已在但本进程 inbox 无此条 = 上一进程生命周
+                    // 期受理过——撤回刚入队的输入，明确回复「未恢
+                    // 复、未重新执行」；不重新入队、不派发。
+                    match kernel
+                        .exec_fact_store()
+                        .record_acceptance(channel_name, &msg_id, &task.id)
+                        .await
+                    {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            kernel.exec_inbox().remove_queued(&task.id, &msg_id);
+                            // 「是否开始」（N12）：曾等待与已派发如
+                            // 实区分——两者都绝不重新执行。
+                            let started = kernel
+                                .exec_fact_store()
+                                .acceptance_for(channel_name, &msg_id)
+                                .await
+                                .ok()
+                                .flatten()
+                                .is_some_and(|a| a.started);
+                            return Ok(Some(if started {
+                                "⚠️ 该输入在重启前已受理并已开始执行；不重复执行。".to_string()
+                            } else {
+                                "⚠️ 该输入在重启前已受理；等待项未恢复、未重新执行。".to_string()
+                            }));
+                        }
+                        Err(e) => {
+                            // 凭据写入失败只 warn（增量 5 事实纪律）：
+                            // 不阻断已受理输入；代价是「DB 故障 + 重
+                            // 启 + 平台重送」组合下凭据缺失会按新输
+                            // 入再受理——如实记录，不伪造拒收。
+                            warn!(error = %e, task_id = %task.id, "exec acceptance record failed; proceeding as accepted");
+                        }
+                    }
                     // 增量 4：受理后的整卡刷新统一走「快照渲染 + 串
                     // 行 PATCH」（hub 路径与事件 relay 同一渲染函数，
                     // N7）。CardPending 半完成态无卡可刷，refresh 内

@@ -56,13 +56,15 @@ pub(crate) async fn create_and_announce(
     }
 
     // 增量 5：新建任务正常无结果行；读取失败不阻断发卡（warn
-    // + 按无结果渲染，下一事件刷新自然补齐）。
+    // + 按无结果渲染，下一事件刷新自然补齐）。新建任务亦无 Run
+    // 事实（增量 6 中断轮凭据）——首发卡恒 None。
     let latest = latest_result_or_none(kernel, &task.id).await;
     let card = task_card(
         &task,
         &kernel.exec_scheduler().snapshot(&task.id),
         task.card_generation,
         latest.as_ref(),
+        None,
     );
     let card_msg_id = match adapter.send_card(chat_id, &card, None).await {
         Ok(Some(id)) => id,
@@ -234,6 +236,22 @@ pub(crate) async fn latest_result_or_none(
         Ok(row) => row,
         Err(e) => {
             warn!(task_id = %task_id, error = %e, "exec card: latest result lookup failed");
+            None
+        }
+    }
+}
+
+/// 读取任务最近一轮 Run 事实（增量 6 卡面中断行的凭据，N11/D9；
+/// 读取失败只 warn，按无 Run 事实渲染——呈现缺失不阻断卡面主
+/// 流程，下一事件刷新自然补齐）。
+pub(crate) async fn latest_run_or_none(
+    kernel: &Arc<Kernel>,
+    task_id: &ExecTaskId,
+) -> Option<crate::exec::ExecRunRow> {
+    match kernel.exec_fact_store().latest_run(task_id).await {
+        Ok(row) => row,
+        Err(e) => {
+            warn!(task_id = %task_id, error = %e, "exec card: latest run lookup failed");
             None
         }
     }

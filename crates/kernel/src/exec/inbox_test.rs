@@ -102,3 +102,39 @@ fn pop_keeps_dedup_memory_and_seq_watermark() {
     assert_eq!(inbox.pop_front(&id).map(|i| i.seq), Some(2));
     assert!(inbox.is_empty(&id));
 }
+
+#[test]
+fn remove_queued_retracts_but_keeps_dedup_memory_and_watermark() {
+    let inbox = ExecInbox::new();
+    let id = task();
+
+    // 增量 6（C1/N12）：受理凭据核对不通过（上一进程生命周期受
+    // 理过）时撤回刚入队的输入——队列移除，但去重记忆与序号水
+    // 位保留（撤回 ≠ 未受理）。
+    inbox.accept(&id, "m1", "ou_a", "第一条", vec![]);
+    inbox.accept(&id, "m2", "ou_a", "第二条", vec![]);
+    assert!(inbox.remove_queued(&id, "m1"));
+    assert_eq!(inbox.len(&id), 1);
+    assert_eq!(
+        inbox.peek_front(&id).map(|i| i.msg_id.clone()),
+        Some("m2".to_string())
+    );
+
+    // 撤回后的进程内重送仍是 Duplicate（静默，不重新入队）。
+    assert_eq!(
+        inbox.accept(&id, "m1", "ou_a", "第一条", vec![]),
+        AcceptOutcome::Duplicate
+    );
+    assert_eq!(inbox.len(&id), 1);
+
+    // 序号水位不因撤回回退。
+    assert_eq!(
+        inbox.accept(&id, "m3", "ou_a", "第三条", vec![]),
+        AcceptOutcome::Accepted { seq: 3 }
+    );
+
+    // 不存在的 msg / 任务：false，无副作用。
+    assert!(!inbox.remove_queued(&id, "ghost"));
+    assert!(!inbox.remove_queued(&task(), "m2"));
+    assert_eq!(inbox.len(&id), 2);
+}
