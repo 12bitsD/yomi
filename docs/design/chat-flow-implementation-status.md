@@ -94,8 +94,16 @@
 - **已知待硬化（P3 协议层，记入下游集成要求）**：结果上报通道只带 native 身份，当前归属=「单 writer 轮序下最早无正文 Run」。某轮合法无正文（如无报告的失败轮）时，下一轮正文会被错配到该轮。正解=真实 adapter 上报必须回显 start_run 授予的 run 身份（C4「上报属于该轮的正文」的协议化）。
 - 偏差（实施方记录，主 agent 复核认可）：`list_tasks_with_activity` 取 `Option<&str>`；`terminal()` 先补 `run_started`（INSERT OR IGNORE）消泵/派发写竞态；测试环境缺 libssl 开发符号链接，实施方用 `~/.local/lib/ssl-dev-shim` 用户级 shim 未动系统。
 
-### P6（重启与故障契约）—— 下一个增量
+## P6：恢复与故障闭环
 
+### 增量 6：重启核对/重送去重/空闲释放/开关收尾 —— ✅ 已验收（commit `67f269e6`）
+
+- 改动：migration v28 `exec_acceptance`（受理凭据：是否开始/何时受理）；分流臂 C1 完整语义（进程内重送静默、跨进程重送撤回+「未恢复、未重新执行」、曾等待/已派发区分）；`boot_sweep`（未闭合 Run 标 interrupted 不伪造终态）+ hub 启动刷新活动卡；`ExecAdapter.release` + per-lane 代次计时释放（暂停有等待项同样释放、队列/暂停不动、恢复用原 native id）；开关语义修正（命中任务+flag off 明确拒收不掉回 chat）；SimControl.resume_fails。
+- 验收（主 agent 独立复跑）：exec:: 40/40、taskflow 18/18；全量 1795 过、仅 4 已知沙箱失败；clippy 65=基线；fmt 过。
+- **已知待硬化（P7）**：分流臂 受理→凭据写入→派发 之间存在微窗口——同任务终态竞态恰落窗口时，跨重启重送项理论上有被派发可能（需同消息并发+终态同微秒落窗，现实概率极低）。正解=受理/凭据/派发检查纳入同一 per-task 异步锁（lane 锁 tokio 化或独立接受锁），随真实 adapter 落地时一并做。
+- 偏差（实施方记录，主 agent 复核认可）：facts 加 `latest_run()`（中断卡面需要读取 API）；重送回复按 acceptance_for 区分 started/waiting 两文案；boot_sweep 在 build_kernel 后置接线。
+
+### 后续：下游集成说明（W3/W5）+ Kimi ACP 契约测试接入 —— 进行中
 ## 未验证项与所需条件（滚动清单）
 
 | 项 | 影响 | 所需条件 |
