@@ -14,7 +14,7 @@ use crate::exec::{AcceptedInput, ExecTask};
 use crate::types::Result;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -67,19 +67,67 @@ pub trait ExecAdapter: Send + Sync {
     async fn cancel(&self, native_session_id: &str) -> Result<()>;
 }
 
+/// `SimAdapter` 的共享控制柄（chat-flow 增量 4，Arc 共享、clone
+/// cheap）：测试与本地驱动经它注入原生终态、动态改自动完成旋钮。
+/// 生产语义不变——prod 装配是挂起模式，本柄不显式调用即无任何
+/// 行为；P3 真实 adapter 替换后本柄随 Sim 一并消失。
+#[derive(Clone, Default)]
+pub struct SimControl {
+    /// 终态上报口（`with_sink` 装配时与 adapter 同口；None = 无从
+    /// 上报，`complete`/`fail`/`cancel_confirms` 静默无操作）
+    sink: Option<ExecAdapterSink>,
+    /// 自动完成旋钮（单一事实源：构造期 `with_complete_after` 与运
+    /// 行期 `set_auto_complete` 都写这里，`start_run` 只读这里）：
+    /// Some(d) = `start_run` ack 后 d 经 sink 报 Completed；None =
+    /// 挂起直到显式注入终态
+    auto_complete: Arc<Mutex<Option<Duration>>>,
+    /// cancel 观察口（与 adapter 共享；停止幂等性断言用）
+    cancelled: Arc<Mutex<Vec<String>>>,
+}
+
+impl SimControl {
+    /// 注入「自然完成」终态（经 sink 上报，C4：不在调用返回里冒充）。
+    pub fn complete(&self, native_session_id: &str) {
+        self.report(native_session_id, TerminalKind::Completed);
+    }
+
+    /// 注入「业务失败」终态。
+    pub fn fail(&self, native_session_id: &str) {
+        self.report(native_session_id, TerminalKind::Failed);
+    }
+
+    /// 注入「取消已确认」终态（停止未确认场景的收口驱动）。
+    pub fn cancel_confirms(&self, native_session_id: &str) {
+        self.report(native_session_id, TerminalKind::Cancelled);
+    }
+
+    /// 动态改自动完成旋钮；None 回到挂起模式。
+    pub fn set_auto_complete(&self, d: Option<Duration>) {
+        *self.auto_complete.lock().unwrap() = d;
+    }
+
+    /// 测试观察口：adapter 已收到的 cancel（按序）。
+    pub fn cancelled_sessions(&self) -> Vec<String> {
+        self.cancelled.lock().unwrap().clone()
+    }
+
+    fn report(&self, native_session_id: &str, kind: TerminalKind) {
+        if let Some(sink) = &self.sink {
+            sink.terminal(native_session_id, kind);
+        }
+    }
+}
+
 /// 仿真 adapter（P1 全程使用；P3 由真实 adapter 替换）。
 ///
 /// `Default` = 全挂起模式：不报完成、不报取消确认——生产装配
 /// （`Kernel::new`）就用它，无真实 Provider 时不伪造任何进展。
-/// 测试旋钮（可注）：`complete_after`（到点经 sink 报 Completed）、
-/// `fail_next_start`（下一次 `start_run` 失败一次）、
-/// `cancel_never_confirms`（cancel 受理后永不报终态）。
+/// 测试旋钮（可注）：`with_complete_after`/`SimControl::set_auto_complete`
+/// （到点经 sink 报 Completed）、`fail_next_start`（下一次 `start_run`
+/// 失败一次）、`cancel_never_confirms`（cancel 受理后永不报终态）。
 pub struct SimAdapter {
     /// 终态回调口（构造时注入；None = 无从上报，全部挂起）
     sink: Option<ExecAdapterSink>,
-    /// Some(d)：`start_run` ack 后 d 经 sink 报 Completed；None =
-    /// 挂起直到测试显式 terminal
-    complete_after: Option<Duration>,
     /// true：cancel 受理后永不报 Cancelled（慢停止/停止丢失场景）
     cancel_never_confirms: bool,
     /// 下一次 `start_run` 返回 Err 一次（随后自动复位）
@@ -88,8 +136,9 @@ pub struct SimAdapter {
     created: Mutex<Vec<String>>,
     /// 测试观察口：`start_run` 收到的（原生身份, 输入）（按序）
     started: Mutex<Vec<(String, AcceptedInput)>>,
-    /// 测试观察口：cancel 收到的原生身份（按序）
-    cancelled: Mutex<Vec<String>>,
+    /// 增量 4：共享控制柄（自动完成旋钮 + cancel 观察口 + 终态注
+    /// 入口的共享副本——见 [`SimControl`]）
+    control: SimControl,
 }
 
 impl Default for SimAdapter {
@@ -97,28 +146,29 @@ impl Default for SimAdapter {
     fn default() -> Self {
         Self {
             sink: None,
-            complete_after: None,
             cancel_never_confirms: true,
             fail_next_start: AtomicBool::new(false),
             created: Mutex::new(Vec::new()),
             started: Mutex::new(Vec::new()),
-            cancelled: Mutex::new(Vec::new()),
+            control: SimControl::default(),
         }
     }
 }
 
 impl SimAdapter {
-    /// 注入终态回调口（构造时注入的 builder 形态）。
+    /// 注入终态回调口（构造时注入的 builder 形态；控制柄同口）。
     #[must_use]
     pub fn with_sink(mut self, sink: ExecAdapterSink) -> Self {
+        self.control.sink = Some(sink.clone());
         self.sink = Some(sink);
         self
     }
 
-    /// `start_run` ack 后 d 自动报 Completed（需同时注入 sink）。
+    /// `start_run` ack 后 d 自动报 Completed（需同时注入 sink；等
+    /// 价于 `SimControl::set_auto_complete(Some(d))` 的构造期形态）。
     #[must_use]
-    pub fn with_complete_after(mut self, d: Duration) -> Self {
-        self.complete_after = Some(d);
+    pub fn with_complete_after(self, d: Duration) -> Self {
+        self.control.set_auto_complete(Some(d));
         self
     }
 
@@ -148,7 +198,13 @@ impl SimAdapter {
 
     /// 测试观察口：已收到的 cancel。
     pub fn cancelled_sessions(&self) -> Vec<String> {
-        self.cancelled.lock().unwrap().clone()
+        self.control.cancelled_sessions()
+    }
+
+    /// 共享控制柄（chat-flow 增量 4）：测试/本地驱动注入终态、动
+    /// 态改自动完成旋钮。clone cheap（Arc 共享同一内核）。
+    pub fn control(&self) -> SimControl {
+        self.control.clone()
     }
 }
 
@@ -170,7 +226,8 @@ impl ExecAdapter for SimAdapter {
             .lock()
             .unwrap()
             .push((native_session_id.to_string(), input.clone()));
-        if let (Some(d), Some(sink)) = (self.complete_after, &self.sink) {
+        let auto_complete = *self.control.auto_complete.lock().unwrap();
+        if let (Some(d), Some(sink)) = (auto_complete, &self.sink) {
             let native = native_session_id.to_string();
             let sink = sink.clone();
             // 同步 ack 先到（上面已记录），终态到点经 sink 异步上报。
@@ -183,7 +240,8 @@ impl ExecAdapter for SimAdapter {
     }
 
     async fn cancel(&self, native_session_id: &str) -> Result<()> {
-        self.cancelled
+        self.control
+            .cancelled
             .lock()
             .unwrap()
             .push(native_session_id.to_string());

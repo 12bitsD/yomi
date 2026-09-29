@@ -99,6 +99,10 @@ pub struct Kernel {
     /// 执行调度器（chat-flow 增量 3，N6/C3/D11）：每卡 lane 单一
     /// 裁定者 + 全局名额统一分配。
     exec_scheduler: Arc<crate::exec::ExecScheduler>,
+    /// `SimAdapter` 控制柄（chat-flow 增量 4）：仅供测试与本地驱动
+    /// 注入终态——生产挂起模式下不调用即无行为；P3 真实 adapter
+    /// 替换后恒 None。
+    exec_sim_control: Option<crate::exec::SimControl>,
     /// `ext_route` 的内存回退路由表（无 channel store 时）：(source, key)
     /// → session。纯内存，daemon 重启后首个 emit 重建映射。
     ext_routes: dashmap::DashMap<(String, String), SessionId>,
@@ -171,6 +175,12 @@ impl Kernel {
     /// 4 通道侧刷新用）。
     pub fn exec_events(&self) -> tokio::sync::broadcast::Receiver<crate::exec::ExecEvent> {
         self.exec_scheduler.subscribe()
+    }
+
+    /// Sim 控制柄（chat-flow 增量 4，测试/本地驱动专用；P3 真实
+    /// adapter 替换后恒 None）。
+    pub fn exec_sim_control(&self) -> Option<crate::exec::SimControl> {
+        self.exec_sim_control.clone()
     }
 
     /// 执行任务的唯一创建契约（chat-flow N1/C2）：slash `/task` 与
@@ -610,8 +620,11 @@ impl Kernel {
         // 生产装配 = 挂起模式 SimAdapter（P3 由真实双 Provider
         // adapter 替换）：不报完成、不报取消确认——无真实 Provider
         // 时不伪造任何进展。
-        let exec_adapter: Arc<dyn crate::exec::ExecAdapter> =
-            Arc::new(crate::exec::SimAdapter::default().with_sink(exec_sink));
+        let exec_adapter = crate::exec::SimAdapter::default().with_sink(exec_sink);
+        // 增量 4：Sim 控制柄与 adapter 同 sink 装配（仅供测试与本
+        // 地驱动注入终态；P3 真实 adapter 替换后恒 None）。
+        let exec_sim_control = Some(exec_adapter.control());
+        let exec_adapter: Arc<dyn crate::exec::ExecAdapter> = Arc::new(exec_adapter);
         let (exec_events_tx, _) = tokio::sync::broadcast::channel(256);
         let exec_inbox = crate::exec::ExecInbox::new();
         let exec_scheduler = Arc::new(crate::exec::ExecScheduler::new(
@@ -664,6 +677,7 @@ impl Kernel {
             exec_task_store: storage.exec_task_store(),
             exec_inbox,
             exec_scheduler,
+            exec_sim_control,
             ext_routes: dashmap::DashMap::new(),
             notification_bus,
             shutdown,

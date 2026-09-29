@@ -54,6 +54,20 @@ pub enum ExecEvent {
     },
 }
 
+impl ExecEvent {
+    /// 事件所属任务（增量 4 relay 按此定位卡；事件只是提示，卡面
+    /// 内容以锁内重读的快照为准——N7）。
+    pub fn task_id(&self) -> &ExecTaskId {
+        match self {
+            Self::RunStarted { task_id, .. }
+            | Self::RunTerminal { task_id, .. }
+            | Self::Paused { task_id }
+            | Self::Resumed { task_id }
+            | Self::StopUnconfirmed { task_id, .. } => task_id,
+        }
+    }
+}
+
 /// `stop_and_pause` 的结果（三态如实，C6）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StopOutcome {

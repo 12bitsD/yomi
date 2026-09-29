@@ -77,17 +77,12 @@ pub(crate) async fn handle_incoming_message(
                 // 生任何可见动作。
                 AcceptOutcome::Duplicate => return Ok(None),
                 AcceptOutcome::Accepted { .. } => {
-                    // 占位卡整卡 PATCH 刷新受理计数（CardKit 局部更
-                    // 新是 P5）。CardPending 半完成态无卡可刷，跳过
-                    // ——受理事实在 inbox，不伪造卡面（D2）。
-                    if let Some(card_msg_id) = &task.card_msg_id {
-                        let card = crate::channels::cards::taskcard::task_card(
-                            &task,
-                            kernel.exec_inbox().len(&task.id),
-                        );
-                        if let Err(e) = adapter.update_card(card_msg_id, &card).await {
-                            warn!(error = %e, task_id = %task.id, "task card accepted-count refresh failed");
-                        }
+                    // 增量 4：受理后的整卡刷新统一走「快照渲染 + 串
+                    // 行 PATCH」（hub 路径与事件 relay 同一渲染函数，
+                    // N7）。CardPending 半完成态无卡可刷，refresh 内
+                    // 自然跳过——受理事实在 inbox，不伪造卡面（D2）。
+                    if let Some(hub) = kernel.channel_manager() {
+                        hub.refresh_exec_task_card(&kernel, &task.id).await;
                     }
                     // 受理成功即尝试派发（增量 3）：暂停/阻断/有在飞
                     // Run/无名额时自然不派发——C3 资格由 lane 锁裁定。

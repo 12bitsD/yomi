@@ -98,6 +98,10 @@ pub struct ChannelHub {
     instances: Arc<DashMap<String, ChannelInstance>>,
     obs: Arc<ObsTracker>,
     ask: Arc<AskCardRegistry>,
+    /// 执行任务卡的 per-task 串行 PATCH 锁注册表（chat-flow 增量
+    /// 4，C9：同一卡任意时刻只有一个 PATCH 在飞；事件 relay 与回
+    /// 调/分流受理刷新共用）。
+    exec_patches: Arc<crate::channels::taskcard::relay::ExecCardPatches>,
 }
 
 impl ChannelHub {
@@ -107,6 +111,7 @@ impl ChannelHub {
             instances: Arc::new(DashMap::new()),
             obs: Arc::new(ObsTracker::new()),
             ask: Arc::new(AskCardRegistry::new()),
+            exec_patches: Arc::new(crate::channels::taskcard::relay::ExecCardPatches::default()),
         }
     }
 
@@ -195,6 +200,10 @@ impl ChannelHub {
                 self.start_event_forwarder(bus, shutdown.child_token(), kernel.clone())
                     .await;
             }
+            // chat-flow 增量 4：exec 事件 → 任务卡刷新 relay（事件
+            // 只是提示，锁内重读快照渲染；仅当存在启用 exec_tasks
+            // 的通道实例——spawn 内自查，无则 warn 记录跳过）。
+            crate::channels::taskcard::relay::spawn_exec_relay(self, &coord);
         }
 
         if errors.is_empty() {
@@ -403,6 +412,18 @@ impl ChannelHub {
                                             return;
                                         };
                                         crate::channels::obs::handle_stop_action(&kernel, &action);
+                                    } else if ns.starts_with("exec_") {
+                                        // 执行任务主卡按钮（chat-flow
+                                        // 增量 4）：停止并暂停/恢复队
+                                        // 列——与 /stop 同档，不叠加
+                                        // admin；C9 重核在 handler 内。
+                                        let Some(kernel) = kernel_weak.upgrade() else {
+                                            return;
+                                        };
+                                        crate::channels::taskcard::handle_exec_action(
+                                            &name, &config, &kernel, &adapter, action,
+                                        )
+                                        .await;
                                     } else if ns.starts_with("bg_") {
                                         let Some(kernel) = kernel_weak.upgrade() else {
                                             return;
@@ -957,6 +978,33 @@ impl ChannelHub {
     /// 检查用，R7）。
     pub(crate) fn channel_config(&self, name: &str) -> Option<ChannelConfig> {
         self.instances.get(name).map(|i| i.config.clone())
+    }
+
+    /// 通道实例表句柄（增量 4：exec relay 按任务通道解析 adapter）。
+    pub(crate) fn instances_handle(&self) -> Arc<DashMap<String, ChannelInstance>> {
+        Arc::clone(&self.instances)
+    }
+
+    /// 任务卡串行 PATCH 锁注册表句柄（增量 4，relay 装配用）。
+    pub(crate) fn exec_patches(&self) -> Arc<crate::channels::taskcard::relay::ExecCardPatches> {
+        Arc::clone(&self.exec_patches)
+    }
+
+    /// 执行任务卡刷新（chat-flow 增量 4）：快照渲染 + per-task 串
+    /// 行 PATCH——按钮回调、分流受理与事件 relay 的唯一共用路径
+    /// （N7/C9）。
+    pub(crate) async fn refresh_exec_task_card(
+        &self,
+        kernel: &Arc<Kernel>,
+        task_id: &crate::types::ExecTaskId,
+    ) {
+        crate::channels::taskcard::relay::refresh_task_card(
+            kernel,
+            &self.instances,
+            &self.exec_patches,
+            task_id,
+        )
+        .await;
     }
 
     /// Check whether a session is routed from an external channel, regardless

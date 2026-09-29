@@ -816,3 +816,595 @@ async fn exec_tasks_off_task_create_tool_refused() {
 
     kernel.stop().await;
 }
+
+// ══ chat-flow 增量 4：卡面控制（按钮 + 回调 + 事件驱动刷新）══════
+//
+// 设计依据 docs/design/chat-flow-technical-design.md C6/C9/N6/N7/R4
+// 与 docs/design/chat-flow-impl/inc-4-spec.md 测试节：回调逐维重核、
+// 事件只是提示（锁内重读快照渲染）、PATCH 失败只 warn。
+
+use crate::channels::CardAction;
+
+/// 构造一次主卡按钮回调（直连 handler，形态与 hub `exec_` 臂分发
+/// 后一致：用户闸已在分发前统一施加，这里不重复演练）。
+fn exec_action(chat: &str, user: &str, value: serde_json::Value) -> CardAction {
+    CardAction {
+        operator_open_id: user.to_string(),
+        operator_union_id: None,
+        chat_id: Some(chat.to_string()),
+        message_id: Some("card-1".to_string()),
+        token: None,
+        value,
+    }
+}
+
+/// 最近一次回调反馈文本（toast 走 `send_action_denial` → 点击所
+/// 在群的文字消息）。
+async fn last_toast(mock: &MockAdapter) -> String {
+    mock.outgoing
+        .lock()
+        .await
+        .last()
+        .and_then(|(_, blocks)| match blocks.first() {
+            Some(ContentBlock::Text { text }) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// 任务绑定的原生身份（N2：持久化绑定；SimControl 注入终态的定
+/// 位凭据）。
+async fn native_id_of(kernel: &Kernel, task_id: &crate::types::ExecTaskId) -> String {
+    kernel
+        .exec_task_store()
+        .get(task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .provider_session_id
+        .expect("bound after first dispatch")
+}
+
+/// 轮询等待异步事实成立（终态经 sink → 泵 → lane、relay PATCH 都
+/// 是异步到达；最长约 3s，超时返回 false 让断言给出上下文）。
+async fn wait_until<F, Fut>(mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..60 {
+        if cond().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// 建任务 + 两条 Thread 输入：t1 立即派发（Sim 挂起 → Running），
+/// t2 排队。返回任务。
+async fn task_with_running_and_queued(
+    kernel: &Arc<Kernel>,
+    store: &Arc<dyn ChannelStore>,
+    config: &ChannelConfig,
+    adapter: &Arc<dyn PlatformAdapter>,
+) -> crate::exec::ExecTask {
+    let obs = Arc::new(ObsTracker::new());
+    handle_incoming_message(
+        "mock",
+        config,
+        store,
+        Arc::clone(kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        adapter,
+    )
+    .await
+    .unwrap();
+    let task = kernel
+        .exec_task_store()
+        .find_by_dedup("mock", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    for (id, text) in [("t1", "先做第一步"), ("t2", "再补个背景")] {
+        handle_incoming_message(
+            "mock",
+            config,
+            store,
+            Arc::clone(kernel),
+            chan_msg("oc_1", "ou_1", id, text, Some("omt_1"), Some("card-1")),
+            &obs,
+            adapter,
+        )
+        .await
+        .unwrap();
+    }
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| (r.status, r.text.as_str())),
+        Some((crate::exec::RunStatus::Running, "先做第一步")),
+        "t1 dispatched and hanging (sim hang mode)"
+    );
+    assert_eq!(kernel.exec_inbox().len(&task.id), 1, "t2 queued");
+    task
+}
+
+fn stop_value(task: &crate::exec::ExecTask, run: &str, gen: i64) -> serde_json::Value {
+    serde_json::json!({
+        "action": "exec_stop",
+        "task": task.id.as_str(),
+        "run": run,
+        "gen": gen,
+    })
+}
+
+fn resume_value(task: &crate::exec::ExecTask, gen: i64) -> serde_json::Value {
+    serde_json::json!({
+        "action": "exec_resume",
+        "task": task.id.as_str(),
+        "run": null,
+        "gen": gen,
+    })
+}
+
+// ── 增量 4 场景 1：按钮全流程（停止并暂停 → 幂等重复）──────────
+
+#[tokio::test]
+async fn exec_stop_button_full_flow_and_idempotent_repeat() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let run_id = kernel
+        .exec_scheduler()
+        .snapshot(&task.id)
+        .current
+        .unwrap()
+        .run_id
+        .as_str()
+        .to_string();
+
+    // 点 ⏹ 停止并暂停：toast 受理 + 卡面「停止中」+ inbox 保留。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, &run_id, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("已受理：停止中，队列已暂停"), "{toast}");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Stopping),
+        "停止中 ≠ 已停止（C6）"
+    );
+    assert!(snap.paused, "队列已暂停");
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        1,
+        "排队输入保留（停止不回滚队列）"
+    );
+    {
+        let updated = mock.updated_cards.lock().await;
+        let last = &updated.last().expect("card refreshed after stop").1;
+        assert!(last.contains("停止中 · 第 1 轮"), "{last}");
+        assert!(last.contains("已暂停 · 进程内 · 重启不保留"), "{last}");
+        assert!(!last.contains("behaviors"), "Stopping 不出按钮: {last}");
+    }
+
+    // 重复点：幂等——同一受理 toast，不重复 cancel。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, &run_id, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("已受理：停止中，队列已暂停"), "{toast}");
+    let control = kernel.exec_sim_control().expect("sim control present");
+    assert_eq!(
+        control.cancelled_sessions().len(),
+        1,
+        "幂等：重复停止不重复 cancel"
+    );
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Stopping)
+    );
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 2：Stopping 受阻 → cancel 确认 → 恢复派发 ──────
+
+#[tokio::test]
+async fn exec_resume_blocked_until_cancel_confirmed_then_resumes() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    // 事件 relay 上岗（事件驱动刷新的被测对象之一）。
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let run_id = kernel
+        .exec_scheduler()
+        .snapshot(&task.id)
+        .current
+        .unwrap()
+        .run_id
+        .as_str()
+        .to_string();
+    let control = kernel.exec_sim_control().unwrap();
+
+    // 先停（Sim 挂起模式：cancel 受理但永不确认 → Stopping 持续）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, &run_id, 0)),
+    )
+    .await;
+
+    // Stopping 中点 ▶ → toast 受阻、仍 paused、不预约自动恢复。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", resume_value(&task, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(
+        toast.contains("停止尚未确认，保持暂停；确认后请再次恢复"),
+        "{toast}"
+    );
+    assert!(
+        kernel.exec_scheduler().snapshot(&task.id).paused,
+        "受阻后仍 paused"
+    );
+    assert_eq!(
+        control.cancelled_sessions().len(),
+        1,
+        "受阻的 resume 不触发任何新动作"
+    );
+
+    // cancel 确认到达（SimControl 注入）→ 卡面「已停止」、仍 paused。
+    control.cancel_confirms(&native_id_of(&kernel, &task.id).await);
+    let tid = task.id.clone();
+    assert!(
+        wait_until(|| {
+            let kernel = &kernel;
+            let tid = &tid;
+            async move {
+                kernel
+                    .exec_scheduler()
+                    .snapshot(tid)
+                    .current
+                    .as_ref()
+                    .map(|r| r.status)
+                    == Some(crate::exec::RunStatus::Stopped)
+            }
+        })
+        .await,
+        "cancel confirmation settles the run as Stopped"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("已停止 · 第 1 轮"))
+        })
+        .await,
+        "relay refreshes the card to 已停止"
+    );
+    assert!(
+        kernel.exec_scheduler().snapshot(&task.id).paused,
+        "终态后队列暂停独立保留（C6）"
+    );
+
+    // 再点 ▶ → 已恢复，继续执行；t2 派发。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", resume_value(&task, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("已恢复，继续执行"), "{toast}");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert!(!snap.paused);
+    assert_eq!(
+        snap.current.as_ref().map(|r| (r.status, r.text.as_str())),
+        Some((crate::exec::RunStatus::Running, "再补个背景")),
+        "恢复后派发下一条（不重试已停止轮，D3）"
+    );
+    assert_eq!(kernel.exec_inbox().len(&task.id), 0, "t2 consumed");
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 3：旧回调（代次/任务/Run 失配）→ 拒绝零副作用 ──
+
+#[tokio::test]
+async fn stale_exec_action_toasts_and_changes_nothing() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+    let patches_before = mock.updated_cards.lock().await.len();
+
+    // gen+1 伪造（旧代卡）→ 过期 toast，零副作用。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, "run_whatever", 1)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("卡片已过期，操作未生效"), "{toast}");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Running),
+        "旧代回调不动任何状态"
+    );
+    assert!(!snap.paused);
+    assert!(control.cancelled_sessions().is_empty());
+
+    // 任务不存在 → 同一过期 toast。
+    let ghost = serde_json::json!({
+        "action": "exec_stop", "task": "task_ghost", "run": "run_x", "gen": 0,
+    });
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", ghost),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("卡片已过期，操作未生效"), "{toast}");
+
+    // run 不匹配的 exec_stop → RunMismatch toast、当前 Run 不受扰
+    // （不取消任何 Run；暂停先生效——stop 语义先于匹配核对，C6）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, "run_bogus", 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(
+        toast.contains("目标轮次已变化（当前第 1 轮状态 执行中），未执行停止"),
+        "{toast}"
+    );
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Running),
+        "当前 Run 不受扰"
+    );
+    assert!(snap.paused, "暂停已生效（stop 语义在先）");
+    assert!(
+        control.cancelled_sessions().is_empty(),
+        "失配不取消任何 Run"
+    );
+
+    // 三次拒绝均未产生卡面 PATCH（拒绝路径零呈现副作用；过期/失
+    // 配刷新只发生在状态确有变化的分支——失配分支刷的是同一事
+    // 实，但前两次纯拒绝不得有 PATCH）。
+    let patches_after = mock.updated_cards.lock().await.len();
+    assert!(
+        patches_after <= patches_before + 1,
+        "stale rejections stay silent (only RunMismatch refreshes): {patches_before} -> {patches_after}"
+    );
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 4：事件驱动刷新 + 未暂停自动派发下一条 ─────────
+
+#[tokio::test]
+async fn terminal_event_drives_card_refresh_and_next_dispatch() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+    let native = native_id_of(&kernel, &task.id).await;
+
+    // t1 自然完成（队列仍有 t2、未暂停）→ relay 刷新；调度器自动
+    // 派发 t2，卡面跟进到「执行中 · 第 2 轮」（N3：不自动暂停）。
+    control.complete(&native);
+    let tid = task.id.clone();
+    assert!(
+        wait_until(|| {
+            let kernel = &kernel;
+            let tid = &tid;
+            async move {
+                kernel
+                    .exec_scheduler()
+                    .snapshot(tid)
+                    .current
+                    .as_ref()
+                    .map(|r| (r.status, r.text.as_str()))
+                    == Some((crate::exec::RunStatus::Running, "再补个背景"))
+            }
+        })
+        .await,
+        "terminal with queued input auto-dispatches the next run (not paused)"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("执行中 · 第 2 轮"))
+        })
+        .await,
+        "relay-driven card follows the new run"
+    );
+    assert_eq!(kernel.exec_inbox().len(&task.id), 0, "t2 consumed");
+
+    // 空队列下的完成：卡面如实落在「第 N 轮已结束（完成）」。
+    control.complete(&native);
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("第 2 轮已结束（完成）"))
+        })
+        .await,
+        "relay refreshes the card to 已结束（完成）"
+    );
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Completed)
+    );
+    assert!(!snap.paused, "自然完成不自动暂停（N3）");
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 5：归档任务 / 关闭通道 → 回调拒绝 ──────────────
+
+#[tokio::test]
+async fn archived_task_and_disabled_channel_reject_actions() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+
+    // 归档 → 回调一律 toast「任务已归档」，零状态变更。
+    kernel.exec_task_store().archive(&task.id).await.unwrap();
+    for value in [resume_value(&task, 0), stop_value(&task, "run_whatever", 0)] {
+        crate::channels::taskcard::handle_exec_action(
+            "mock",
+            &config,
+            &kernel,
+            &adapter,
+            exec_action("oc_1", "ou_1", value),
+        )
+        .await;
+        let toast = last_toast(&mock).await;
+        assert!(toast.contains("任务已归档"), "{toast}");
+    }
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert!(
+        !snap.paused && control.cancelled_sessions().is_empty(),
+        "archived task: zero state change"
+    );
+    kernel.stop().await;
+
+    // exec_tasks=false 通道：回调拒绝（拒绝先于任何 store 读写）。
+    let (kernel, mock, _store, config, _tmp) = task_harness_with_exec_tasks(false).await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let ghost = serde_json::json!({
+        "action": "exec_resume", "task": "task_ghost", "run": null, "gen": 0,
+    });
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", ghost),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("未启用执行任务功能"), "{toast}");
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 附：PATCH 失败只 warn——不改任务状态、无重试风暴 ─────
+
+#[tokio::test]
+async fn relay_patch_failure_warns_only_and_never_mutates_state() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+    let native = native_id_of(&kernel, &task.id).await;
+
+    // 平台 PATCH 故障：终态照常收口（呈现失败不影响事实），失败
+    // 的 PATCH 不进入记录（mock 只记成功）。
+    mock.fail_updates
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let calls_before = mock.update_calls.load(std::sync::atomic::Ordering::Relaxed);
+    control.complete(&native);
+    let tid = task.id.clone();
+    assert!(
+        wait_until(|| {
+            let kernel = &kernel;
+            let tid = &tid;
+            async move {
+                kernel
+                    .exec_scheduler()
+                    .snapshot(tid)
+                    .current
+                    .as_ref()
+                    .map(|r| (r.status, r.text.as_str()))
+                    == Some((crate::exec::RunStatus::Running, "再补个背景"))
+            }
+        })
+        .await,
+        "state settles regardless of patch failures (C9: 呈现待同步)"
+    );
+    assert!(
+        !mock
+            .updated_cards
+            .lock()
+            .await
+            .iter()
+            .any(|(_, c)| c.contains("第 1 轮已结束")),
+        "failed patches never land"
+    );
+
+    // 无重试风暴：等 relay 至少处理了一个事件（失败的 PATCH 也
+    // 计入调用数），随后静默期内调用数不再增长（下一事件自然带
+    // 来新快照，而不是原地重试）。
+    assert!(
+        wait_until(|| async {
+            mock.update_calls.load(std::sync::atomic::Ordering::Relaxed) > calls_before
+        })
+        .await,
+        "relay attempted patches (and failed)"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let settled = mock.update_calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        settled - calls_before <= 4,
+        "bounded patch attempts (one per hint): {calls_before} -> {settled}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.update_calls.load(std::sync::atomic::Ordering::Relaxed),
+        settled,
+        "no retry storm after a failed patch"
+    );
+
+    kernel.stop().await;
+}

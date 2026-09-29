@@ -26,7 +26,9 @@ pub mod inbox;
 pub mod run;
 pub mod scheduler;
 pub mod store;
-pub use adapter::{ExecAdapter, ExecAdapterSink, SimAdapter, TerminalKind, TerminalNotice};
+pub use adapter::{
+    ExecAdapter, ExecAdapterSink, SimAdapter, SimControl, TerminalKind, TerminalNotice,
+};
 pub use inbox::{AcceptOutcome, AcceptedInput, ExecInbox};
 pub use run::{RunRecord, RunStatus};
 pub use scheduler::{ExecEvent, ExecScheduler, LaneSnapshot, ResumeOutcome, StopOutcome};

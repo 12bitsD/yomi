@@ -46,6 +46,11 @@ pub struct MockAdapter {
     /// unaffected.
     pub issue_ids: std::sync::atomic::AtomicBool,
     pub send_counter: std::sync::atomic::AtomicUsize,
+    /// `update_card` 调用计数（增量 4：断言 PATCH 无重试风暴用）。
+    pub update_calls: std::sync::atomic::AtomicUsize,
+    /// When true, `update_card` fails (platform outage)——增量 4
+    /// PATCH 失败「只 warn、不改状态」路径测试。
+    pub fail_updates: std::sync::atomic::AtomicBool,
 }
 
 impl MockAdapter {
@@ -66,6 +71,8 @@ impl MockAdapter {
             status_card_ok: std::sync::atomic::AtomicBool::new(false),
             issue_ids: std::sync::atomic::AtomicBool::new(false),
             send_counter: std::sync::atomic::AtomicUsize::new(0),
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_updates: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -201,6 +208,13 @@ impl PlatformAdapter for MockAdapter {
         message_id: &str,
         card_json: &str,
     ) -> std::result::Result<(), crate::channels::ChannelError> {
+        self.update_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.fail_updates.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::channels::ChannelError::Platform(
+                "mock update_card failure".into(),
+            ));
+        }
         self.updated_cards
             .lock()
             .await
