@@ -121,7 +121,14 @@
 - 验收（主 agent 独立复跑）：renewal 13/13、export 5/5、cardkit 3/3；全量 1817 过、仅 4 已知沙箱失败；clippy 65=基线；fmt 过。
 - 偏差（实施方记录 + 主 agent 当日官方文档复核确认）：`batch_update`=POST、`element content`=PUT（原规格 PUT/PATCH 组合不存在）；v29 前存量行 `card_sent_at` NULL 回退 `created_at`（保守方向）。主 agent 追加修正：content 方法正名 `cardkit_element_content_update`（原名 patch 与官方 PATCH /elements 端点混淆）。
 
-### 后续：增量 9（微窗口硬化 + harness-e2e 回归尝试）—— 进行中
+### 增量 9：受理/凭据/派发微窗口硬化 —— ✅ 已验收（commit `0a86d906`）
+
+- 改动：`accept_input`（scheduler）收敛「查重→凭据→入队」为持 per-task `accept_lock` 单一方法，与 `try_dispatch` 取队段互斥；锁序 lanes 表锁→accept_lock→lane 锁，持锁段内零 await；`remove_queued` 删。
+- 验证（实施方跑无锁矩阵、主 agent 复核）：锁-only revert→并发同 msg 重送重复判 NotRecovered 确定性失败；inc-6 窗口变体 revert→重送项被 terminal 重派并 mark_started（N12 违反复现）；恢复后全绿。场景 2 形状修正为「A 在飞+B 注入∥A 终态」（C3 单在飞下原形状打不到窗口，如实记录）。
+- 主 agent 复跑：exec:: 47/47、taskflow 18/18、clippy 65=基线、fmt 过。
+- 结论：增量 6 记录的 P7 硬化项关闭。
+
+### 后续：增量 10（N5/C5 当前轮问答生命周期 + ACP 真实授权验证）—— 进行中
 ## harness-e2e 回归（工具表变更后，AGENTS.md 要求）—— ✅ 15/17，两失败均非回归
 
 - 环境建设（容器 apt 源受限全录）：sqlite3 CLI 无包→`/root/.local/bin/sqlite3` python shim；libssl-dev/protobuf-compiler 无包→镜像站抽 `libssl-dev_3.5.7` 到 `/root/.local/ssl-dev`（arch 头文件合并）、`protoc 25.8` 到 `/root/.local/protoc`（均用户级，未动系统）；链接经 `OPENSSL_DYNAMIC=1`+shim 目录。**关键坑**：容器全局 env 有 `YOMI_EXTRA_SOCKET=ws://0.0.0.0:57231`（生产占用）——测试 daemon 必须 `env -u YOMI_EXTRA_SOCKET`，否则 extra 绑定失败触发「清主 socket 文件后退出」路径（daemon 假死后连接 ENOENT、重绑 EADDRINUSE 的根因）。
