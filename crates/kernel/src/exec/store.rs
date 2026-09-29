@@ -163,6 +163,26 @@ impl ExecTaskStore for SqliteExecTaskStore {
         Ok(row.map(ExecTaskDbRow::into_task))
     }
 
+    async fn find_by_thread_root(
+        &self,
+        channel_name: &str,
+        root_msg_id: &str,
+    ) -> Result<Option<ExecTask>> {
+        let row = sqlx::query_as::<_, ExecTaskDbRow>(
+            r"SELECT id, channel_name, provider, status, binding,
+                     provider_session_id, thread_root_msg_id, card_msg_id, card_generation,
+                     goal, working_dir, created_by, source, dedup_key, created_at, updated_at
+              FROM exec_tasks WHERE channel_name = ? AND thread_root_msg_id = ?",
+        )
+        .bind(channel_name)
+        .bind(root_msg_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| storage_err(format!("Failed to find exec task by thread root: {e}")))?;
+
+        Ok(row.map(ExecTaskDbRow::into_task))
+    }
+
     async fn bind_provider_session(
         &self,
         id: &ExecTaskId,

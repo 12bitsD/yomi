@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod inbox;
 pub mod store;
+pub use inbox::{AcceptOutcome, AcceptedInput, ExecInbox};
 pub use store::SqliteExecTaskStore;
 
 /// 执行 Provider（原生 agent 后端；P1 全程用仿真创建原生 Session）
@@ -227,6 +229,15 @@ pub trait ExecTaskStore: Send + Sync {
 
     /// 按 dedup 键查找。
     async fn find_by_dedup(&self, channel_name: &str, dedup_key: &str) -> Result<Option<ExecTask>>;
+
+    /// 按 Thread 根消息查找（增量 2 的任务 Thread 分流入口）：任务
+    /// 卡即 Thread 锚，`thread_root_msg_id` 命中即「本 Thread 属于
+    /// 该任务」，消息确定性分流、不进普通 chat 路径（N1/N2）。
+    async fn find_by_thread_root(
+        &self,
+        channel_name: &str,
+        root_msg_id: &str,
+    ) -> Result<Option<ExecTask>>;
 
     /// 持久化原生 Session 绑定。状态机：仅 `Uninitialized -> Bound`
     /// 合法；`Bound` 且同 id → 幂等返回；`Bound` 且不同 id 或

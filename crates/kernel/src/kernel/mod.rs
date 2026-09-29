@@ -93,6 +93,9 @@ pub struct Kernel {
     /// Exec task registry (chat-flow W1)：执行任务登记/绑定状态机
     /// 持久化。取自 `StorageSet`，不经 `Kernel::new` 参数。
     exec_task_store: Arc<dyn crate::exec::ExecTaskStore>,
+    /// 任务 Thread 输入的进程内受理登记（chat-flow 增量 2，D2：
+    /// 重启清空）。
+    exec_inbox: crate::exec::ExecInbox,
     /// `ext_route` 的内存回退路由表（无 channel store 时）：(source, key)
     /// → session。纯内存，daemon 重启后首个 emit 重建映射。
     ext_routes: dashmap::DashMap<(String, String), SessionId>,
@@ -149,6 +152,30 @@ impl Kernel {
     /// Get the exec task registry store (chat-flow W1).
     pub fn exec_task_store(&self) -> Arc<dyn crate::exec::ExecTaskStore> {
         self.exec_task_store.clone()
+    }
+
+    /// 任务 Thread 输入的受理登记（进程内语义，重启清空——D2）。
+    pub fn exec_inbox(&self) -> &crate::exec::ExecInbox {
+        &self.exec_inbox
+    }
+
+    /// 执行任务的唯一创建契约（chat-flow N1/C2）：slash `/task` 与
+    /// 内建工具 `task_create` 两入口都经本方法，不各自直连 store。
+    /// 薄封装 `ExecTaskStore::create`：在此收口入口级校验——goal 非
+    /// 空（trim 后）；provider 的合法性由 `ExecProvider` 枚举在边界
+    /// 解析时保证（serde/FromStr 只收 kimi|codex），此处无字符串态
+    /// 可校验。返回 `(task, created)`：同 `channel_name + dedup_key`
+    /// 重送收敛到同一任务（`created=false`，既有行不变）。
+    pub async fn create_exec_task(
+        &self,
+        input: crate::exec::CreateExecTask,
+    ) -> Result<(crate::exec::ExecTask, bool)> {
+        if input.goal.trim().is_empty() {
+            return Err(KernelError::task(
+                "exec task goal must not be empty".to_string(),
+            ));
+        }
+        self.exec_task_store.create(&input).await
     }
 
     /// Get pinned session store
@@ -520,6 +547,7 @@ impl Kernel {
         )
         .with_cron(cron_store.clone(), Arc::clone(&cron_scheduler))
         .with_config_auto_approve(config_auto_approve)
+        .with_exec_task_store(Some(storage.exec_task_store()))
         .with_persist_pool(persist_pool);
 
         let agent_shared = match todo_interceptor {
@@ -560,7 +588,7 @@ impl Kernel {
             None
         };
 
-        Ok(Arc::new(Self {
+        let kernel = Arc::new(Self {
             agent_shared,
             input_bus,
             conductor,
@@ -579,12 +607,17 @@ impl Kernel {
             kv_cache: storage.kv_cache(),
             channel_manager,
             exec_task_store: storage.exec_task_store(),
+            exec_inbox: crate::exec::ExecInbox::new(),
             ext_routes: dashmap::DashMap::new(),
             notification_bus,
             shutdown,
             intake,
             started_at: Utc::now(),
-        }))
+        });
+        // 填 Kernel 回指 slot：`task_create` 工具经 AgentShared 升级
+        // 回本 Kernel 调 `create_exec_task`（N1 单一创建契约）。
+        kernel.agent_shared.set_kernel(&kernel);
+        Ok(kernel)
     }
 
     pub fn start(&self) {

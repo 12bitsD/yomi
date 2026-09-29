@@ -21,6 +21,7 @@ pub mod skill_load;
 pub mod sleep;
 pub mod subagent;
 pub mod task;
+pub mod task_create;
 pub mod todo;
 #[cfg(feature = "websearch")]
 pub mod websearch;
@@ -44,6 +45,7 @@ pub use shell::{ShellTool, ShellToolCtx, SHELL_TOOL_NAME};
 pub use skill_load::{SkillTool, SKILL_FILENAME, SKILL_TOOL_NAME};
 pub use sleep::{SleepTool, SLEEP_TOOL_NAME};
 pub use subagent::{SubagentTool, SUBAGENT_TOOL_NAME};
+pub use task_create::{TaskCreateTool, TASK_CREATE_TOOL_NAME};
 pub use todo::{TodoTool, TODO_TOOL_NAME};
 #[cfg(feature = "websearch")]
 pub use websearch::WebSearchTool;
@@ -386,6 +388,15 @@ impl ToolRegistry {
             } else {
                 tracing::warn!("Cron tool enabled but cron store not configured; skipping");
             }
+        }
+
+        // task_create（chat-flow N1 Skill 路径）：执行任务登记配好即
+        // 注册——不依赖 channel_hub，无通道会话也可仅登记（no_channel）。
+        if config.shared.exec_task_store.is_some() {
+            self.register(TaskCreateTool::new(
+                config.shared.channel_hub.clone(),
+                config.shared.kernel_weak(),
+            ));
         }
 
         // ask_user 整体下线（2026-08）：交互价值不抵问题（多题聚合、

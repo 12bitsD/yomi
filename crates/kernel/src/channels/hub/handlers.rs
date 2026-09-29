@@ -25,6 +25,7 @@ use crate::channels::hub_routing::{
 use crate::channels::{
     obs::ObsTracker, ChannelConfig, ChannelMessage, ChannelStore, PlatformAdapter, PlatformConfig,
 };
+use crate::exec::{AcceptOutcome, CreateExecTask, ExecTaskSource, ExecTaskStatus};
 
 pub(crate) async fn handle_incoming_message(
     channel_name: &str,
@@ -50,6 +51,47 @@ pub(crate) async fn handle_incoming_message(
         mapping_key = %mapping_key,
         "session mapping"
     );
+
+    // ── 任务 Thread 分流（chat-flow N1/C1）──────────────────────
+    // 命中任务 Thread 的普通消息确定性分流到任务受理：绝不进入 chat
+    // 路径（不 prepare_trigger、不 steer、不建 chat session）。slash
+    // 命令在任务 Thread 内不分流、保持旧语义（`/task` 由其命令臂拒
+    // 绝嵌套）；未命中任务的 Thread 消息原逻辑零改动。
+    if matches!(cmd, ChannelCommand::None) {
+        if let Some(task) = task_thread_hit(&kernel, adapter, channel_name, &msg).await? {
+            // 归档不删历史，也不再受理新输入（D8）。
+            if task.status == ExecTaskStatus::Archived {
+                return Ok(Some("⏹ 任务已归档，不接受新输入。".to_string()));
+            }
+            let outcome = kernel.exec_inbox().accept(
+                &task.id,
+                msg.external_message_id.clone().unwrap_or_default(),
+                msg.external_user_id.clone(),
+                msg.raw_text.clone().unwrap_or_default(),
+                msg.image_keys.clone(),
+            );
+            match outcome {
+                // 重送静默：受理是一次性事实（C1），重复投递不再产
+                // 生任何可见动作。
+                AcceptOutcome::Duplicate => return Ok(None),
+                AcceptOutcome::Accepted { .. } => {
+                    // 占位卡整卡 PATCH 刷新受理计数（CardKit 局部更
+                    // 新是 P5）。CardPending 半完成态无卡可刷，跳过
+                    // ——受理事实在 inbox，不伪造卡面（D2）。
+                    if let Some(card_msg_id) = &task.card_msg_id {
+                        let card = crate::channels::cards::taskcard::task_card(
+                            &task,
+                            kernel.exec_inbox().len(&task.id),
+                        );
+                        if let Err(e) = adapter.update_card(card_msg_id, &card).await {
+                            warn!(error = %e, task_id = %task.id, "task card accepted-count refresh failed");
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+    }
 
     match cmd {
         ChannelCommand::Help => {
@@ -195,6 +237,13 @@ pub(crate) async fn handle_incoming_message(
         }
         ChannelCommand::InvalidThreadCommand => Ok(Some(
             "Usage: `/thread <text>` — the reply opens a new thread.".to_string(),
+        )),
+        ChannelCommand::Task { provider, goal } => {
+            handle_task_command(channel_name, &kernel, adapter, &msg, provider, goal).await
+        }
+        ChannelCommand::InvalidTaskCommand => Ok(Some(
+            "Usage: `/task [kimi|codex] <goal>` — register an exec task on its own card thread."
+                .to_string(),
         )),
         ChannelCommand::InvalidSteerCommand => Ok(Some(
             "Usage: `/steer <text>` — inject a message into the current run.".to_string(),
@@ -844,6 +893,117 @@ pub(crate) async fn handle_incoming_message(
             .await;
             kernel.send_steer(&sid, content).await;
             Ok(None)
+        }
+    }
+}
+
+/// 任务 Thread 命中检查（Thread 分流与 `/task` 嵌套拒绝共用）：本
+/// 消息在 Thread 内且其根消息命中任务登记（卡即 Thread 锚）时返回
+/// 该任务。根解析失败退回「未命中」——宁可落回原 chat 路径，也不
+/// 误拦正常对话。
+async fn task_thread_hit(
+    kernel: &Kernel,
+    adapter: &Arc<dyn PlatformAdapter>,
+    channel_name: &str,
+    msg: &ChannelMessage,
+) -> Result<Option<crate::exec::ExecTask>> {
+    if msg.thread_id.is_none() {
+        return Ok(None);
+    }
+    let root = match msg.root_id.clone() {
+        Some(r) => Some(r),
+        None => adapter
+            .thread_root_id(msg.thread_id.as_deref().unwrap_or_default())
+            .await
+            .unwrap_or_else(|e| {
+                warn!(error = %e, "thread root lookup failed for task-thread check");
+                None
+            }),
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    kernel
+        .exec_task_store()
+        .find_by_thread_root(channel_name, &root)
+        .await
+}
+
+/// 任务 id 短码（回执/卡面显示用，前 12 字符）。
+fn short_task_id(t: &crate::exec::ExecTask) -> &str {
+    &t.id.as_str()[..12.min(t.id.as_str().len())]
+}
+
+/// `/task`（chat-flow N1 专用入口）：登记任务 + 发占位主卡（卡即
+/// Thread 锚），按 `AnnounceOutcome` 文字回执。任务 Thread 内拒绝
+/// 嵌套；权限与 `/stop` 同档——消息闸（`allowed_users`）之外不叠加
+/// admin（创建不是管理配置）。
+async fn handle_task_command(
+    channel_name: &str,
+    kernel: &Arc<Kernel>,
+    adapter: &Arc<dyn PlatformAdapter>,
+    msg: &ChannelMessage,
+    provider: crate::exec::ExecProvider,
+    goal: String,
+) -> Result<Option<String>> {
+    // 任务 Thread 内不嵌套建任务（普通 chat Thread 内允许——卡发
+    // 到群顶层，从那里另开任务 Thread）。
+    if task_thread_hit(kernel, adapter, channel_name, msg)
+        .await?
+        .is_some()
+    {
+        return Ok(Some(
+            "⛔ 本 Thread 已绑定执行任务，不支持在任务 Thread 内再建任务。请到群顶层使用 `/task`。"
+                .to_string(),
+        ));
+    }
+    let chat_id = &msg.external_chat_id;
+    let input = CreateExecTask {
+        channel_name: channel_name.to_string(),
+        provider,
+        goal,
+        working_dir: None,
+        created_by: msg.external_user_id.clone(),
+        source: ExecTaskSource::Entry,
+        // dedup 凭据 = 触发消息 id：同一消息的重送/重投收敛到同一
+        // 任务（C1）。无消息 id 时生成一次性键——宁可多建，不误并。
+        dedup_key: msg
+            .external_message_id
+            .clone()
+            .unwrap_or_else(|| format!("entry-nomid-{}", crate::types::ExecTaskId::new().as_str())),
+    };
+    let short = short_task_id;
+    match crate::channels::taskcard::create_and_announce(kernel, adapter, chat_id, input).await? {
+        crate::channels::taskcard::AnnounceOutcome::Ready { task, card_msg_id } => {
+            let link = adapter.message_link(chat_id, &card_msg_id).await;
+            let link_text = link.map_or_else(String::new, |l| format!("（[任务卡]({l})）"));
+            Ok(Some(format!(
+                "✅ 任务已创建：`{}` · provider `{}`{link_text}。在任务卡的 Thread 回复即向本任务交办。",
+                short(&task),
+                task.provider,
+            )))
+        }
+        crate::channels::taskcard::AnnounceOutcome::Existing { task } => {
+            // 同一创建意图重送：返回原任务与原卡链接，不重复发卡（C1）。
+            let link = match &task.card_msg_id {
+                Some(id) => adapter.message_link(chat_id, id).await,
+                None => None,
+            };
+            let link_text = link.map_or_else(String::new, |l| format!("（[任务卡]({l})）"));
+            Ok(Some(format!(
+                "ℹ️ 本条消息已创建过任务：`{}` · provider `{}`{link_text}（同一请求不重复建）。",
+                short(&task),
+                task.provider,
+            )))
+        }
+        crate::channels::taskcard::AnnounceOutcome::CardPending { task, error } => {
+            // C2 半完成态如实：任务身份已保留，卡未投递；本增量不自
+            // 动补卡、不重试建任务。
+            Ok(Some(format!(
+                "⚠️ 任务已登记（`{}` · provider `{}`），但占位卡投递失败：{error}。任务身份保留；暂不自动补卡。",
+                short(&task),
+                task.provider,
+            )))
         }
     }
 }

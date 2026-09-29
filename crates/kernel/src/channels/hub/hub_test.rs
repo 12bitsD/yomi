@@ -37,6 +37,8 @@ pub struct MockAdapter {
     thread_root_cache: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Cards sent: (chat, card json, reply anchor).
     pub cards: tokio::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    /// Cards updated in place: (message id, card json).
+    pub updated_cards: tokio::sync::Mutex<Vec<(String, String)>>,
     /// Gates `supports_status_card` (default false → text fallback).
     pub status_card_ok: std::sync::atomic::AtomicBool,
     /// When true, `send_message` returns synthetic ids (msg-1, msg-2, …)
@@ -60,6 +62,7 @@ impl MockAdapter {
             thread_root_calls: tokio::sync::Mutex::new(Vec::new()),
             thread_root_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             cards: tokio::sync::Mutex::new(Vec::new()),
+            updated_cards: tokio::sync::Mutex::new(Vec::new()),
             status_card_ok: std::sync::atomic::AtomicBool::new(false),
             issue_ids: std::sync::atomic::AtomicBool::new(false),
             send_counter: std::sync::atomic::AtomicUsize::new(0),
@@ -191,6 +194,18 @@ impl PlatformAdapter for MockAdapter {
             reply_msg_id.map(str::to_string),
         ));
         Ok(Some("card-1".to_string()))
+    }
+
+    async fn update_card(
+        &self,
+        message_id: &str,
+        card_json: &str,
+    ) -> std::result::Result<(), crate::channels::ChannelError> {
+        self.updated_cards
+            .lock()
+            .await
+            .push((message_id.to_string(), card_json.to_string()));
+        Ok(())
     }
 
     async fn download_message_image(

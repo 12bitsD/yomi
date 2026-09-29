@@ -25,6 +25,7 @@ pub(crate) mod comment;
 pub(crate) mod cards;
 pub(crate) mod platform;
 pub(crate) mod render;
+pub(crate) mod taskcard;
 
 pub mod hub;
 

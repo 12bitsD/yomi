@@ -185,6 +185,48 @@ async fn test_set_thread_and_card_and_find_by_dedup() {
 }
 
 #[tokio::test]
+async fn test_find_by_thread_root() {
+    let store = create_test_store().await;
+    let (task, _) = store.create(&input("feishu", "k1", "g")).await.unwrap();
+
+    // 未回填前查不到
+    assert!(store
+        .find_by_thread_root("feishu", "om_thread_root")
+        .await
+        .unwrap()
+        .is_none());
+
+    store
+        .set_thread_and_card(&task.id, "om_thread_root", "om_card")
+        .await
+        .unwrap();
+
+    // 命中：channel + root 双条件（走 idx_exec_tasks_thread 索引）
+    let found = store
+        .find_by_thread_root("feishu", "om_thread_root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(found.id, task.id);
+    assert_eq!(found.card_msg_id.as_deref(), Some("om_card"));
+
+    // 同 root 不同通道不命中；归档后仍命中（归档任务的 Thread 输入
+    // 要分流到「已归档拒收」而不是落回普通 chat）。
+    assert!(store
+        .find_by_thread_root("telegram", "om_thread_root")
+        .await
+        .unwrap()
+        .is_none());
+    store.archive(&task.id).await.unwrap();
+    let archived = store
+        .find_by_thread_root("feishu", "om_thread_root")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(archived.status, ExecTaskStatus::Archived);
+}
+
+#[tokio::test]
 async fn test_archive_keeps_row() {
     let store = create_test_store().await;
     let (task, _) = store.create(&input("feishu", "k1", "g")).await.unwrap();

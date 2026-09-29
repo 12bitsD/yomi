@@ -420,6 +420,14 @@ pub struct AgentShared {
     pub(crate) persist_pool: Option<Arc<crate::kernel::persist_pool::PersistPool>>,
     /// Cron store for scheduled job operations (None when cron is disabled).
     pub cron_store: Option<Arc<dyn crate::cron::CronStore>>,
+    /// Exec task registry (chat-flow W1/N1)：`task_create` 工具的登记
+    /// 入口；`None` 时工具不注册。
+    pub exec_task_store: Option<Arc<dyn crate::exec::ExecTaskStore>>,
+    /// Kernel 回指（slot 模式，同 `cron_scheduler`）：`Kernel::new`
+    /// 收尾时填入。`task_create` 工具经它调 `Kernel::create_exec_task`
+    /// ——N1 双入口共用同一创建契约；工具在 spawn 装配期拿不到
+    /// `Arc<Kernel>`（所有权环：Kernel 持有本结构）。
+    kernel_ref: Arc<std::sync::Mutex<Option<std::sync::Weak<crate::kernel::Kernel>>>>,
     /// Shared slot for the running cron scheduler. Owned by `Kernel`, filled by
     /// `KernelServer` on start; tools use it to notify the scheduler of job
     /// changes. Empty when not running under a daemon.
@@ -500,6 +508,8 @@ impl AgentShared {
             subagent_claims: Arc::new(dashmap::DashSet::new()),
             persist_pool: None,
             cron_store: None,
+            exec_task_store: None,
+            kernel_ref: Arc::new(std::sync::Mutex::new(None)),
             cron_scheduler: Arc::new(std::sync::Mutex::new(None)),
             config_auto_approve: crate::permission::Level::default(),
         }
@@ -544,6 +554,38 @@ impl AgentShared {
         self.cron_store = store;
         self.cron_scheduler = scheduler;
         self
+    }
+
+    /// Set the exec task registry store (chat-flow N1：任务登记经
+    /// `Kernel::create_exec_task`，本字段是工具侧的 store 视图）。
+    #[must_use]
+    pub fn with_exec_task_store(
+        mut self,
+        store: Option<Arc<dyn crate::exec::ExecTaskStore>>,
+    ) -> Self {
+        self.exec_task_store = store;
+        self
+    }
+
+    /// 填入 Kernel 回指（`Kernel::new` 收尾时调用一次）。
+    pub(crate) fn set_kernel(&self, kernel: &Arc<crate::kernel::Kernel>) {
+        *self.kernel_ref.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(kernel));
+    }
+
+    /// Kernel 回指的 Weak 副本（未填入时返回恒空 Weak——直接构造的
+    /// AgentShared，如纯存储测试）。工具持 Weak 而非 Arc：Kernel →
+    /// Conductor → `ToolRegistry` → Tool 的强引用环必须在此断开。
+    pub fn kernel_weak(&self) -> std::sync::Weak<crate::kernel::Kernel> {
+        self.kernel_ref
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// 升级 Kernel 回指；`None` = 尚未填入或 Kernel 已销毁（关停尾段）。
+    pub fn kernel(&self) -> Option<Arc<crate::kernel::Kernel>> {
+        self.kernel_weak().upgrade()
     }
 
     /// Set the global config's auto-approve threshold.

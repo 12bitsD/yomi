@@ -1042,3 +1042,7 @@ fn build_adapter(
 #[cfg(test)]
 #[path = "hub_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "taskflow_test.rs"]
+mod taskflow_tests;
