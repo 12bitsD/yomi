@@ -37,12 +37,20 @@
 //!   时被任何 lane 状态变化打断；释放不消费队列、不解暂停、不
 //!   发事件伪造状态——恢复是下次派发用原 native id（D9）。
 //!
+//! 增量 9 追加（N12/C1）：受理/凭据/派发微窗口硬化——「进程内
+//! 查重 → 受理凭据 → 入队」收敛为 `accept_input` 单一方法，与
+//! `try_dispatch` 的取队段共用 per-task 异步受理锁
+//! （`accept_locks`）；锁序全局统一：lanes 表锁永远最先，
+//! `accept_lock` 先于 lane 锁，持锁段内零 await。跨进程重送凭
+//! 据核对不通过时根本不入队（增量 6「先入队再撤回」的窗口不
+//! 复存在）——重送项对派发永不可见，绝不重复执行。
+//!
 //! 事件（`ExecEvent`，tokio broadcast）只是提示（hint）——状态唯
 //! 一事实源是 lane 锁内字段（增量 4 卡面据此刷新，不据事件推断）。
 
 use crate::exec::adapter::{AdapterNotice, ExecAdapter, TerminalKind, TerminalNotice};
 use crate::exec::run::{RunRecord, RunStatus};
-use crate::exec::{BindingState, ExecFactStore, ExecInbox, ExecTaskStore};
+use crate::exec::{AcceptOutcome, BindingState, ExecFactStore, ExecInbox, ExecTask, ExecTaskStore};
 use crate::types::{ExecTaskId, KernelError, Result, RunId};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -122,6 +130,20 @@ pub enum ResumeOutcome {
     BlockedStopUnconfirmed,
 }
 
+/// `accept_input` 的受理判定（增量 9，N12/C1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AcceptVerdict {
+    /// 新受理（任务内序号，先到先得）。
+    Accepted { seq: u64 },
+    /// 进程内重送：静默——受理是一次性事实（C1），重复投递零
+    /// 可见动作。
+    Duplicate,
+    /// 跨进程重送：受理凭据先于本进程存在（上一进程生命周期受
+    /// 理过）——不入队、不派发；`started` 如实区分「曾等待」与
+    /// 「已派发」（两者都绝不重新执行），回复文案由调用方给出。
+    NotRecovered { started: bool },
+}
+
 /// 卡面/查询用的 lane 快照（增量 4 接卡面）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaneSnapshot {
@@ -176,6 +198,12 @@ impl TaskLane {
 /// 执行调度器（每卡 lane + 全局名额）。
 pub struct ExecScheduler {
     lanes: DashMap<ExecTaskId, Arc<Mutex<TaskLane>>>,
+    /// 受理锁（增量 9，N12/C1）：`accept_input` 的「查重→凭据→
+    /// 入队」与 `try_dispatch` 的 C3 判定 + peek 段共用同一把
+    /// per-task 异步锁。锁序全局统一：lanes 表锁永远最先，
+    /// `accept_lock` 先于 lane 锁，无反向嵌套；lane 锁（std）
+    /// 不跨 `.await` 的纪律不变。
+    accept_locks: DashMap<ExecTaskId, Arc<tokio::sync::Mutex<()>>>,
     /// 全局并发名额（`exec.max_concurrent_runs`，统一分配）
     slots: Arc<Semaphore>,
     store: Arc<dyn ExecTaskStore>,
@@ -202,6 +230,7 @@ impl ExecScheduler {
     ) -> Self {
         Self {
             lanes: DashMap::new(),
+            accept_locks: DashMap::new(),
             slots: Arc::new(Semaphore::new(config.max_concurrent_runs)),
             store,
             adapter,
@@ -450,6 +479,80 @@ impl ExecScheduler {
         )
     }
 
+    /// 取受理锁（增量 9；与 lanes 表同律：表锁先行、取到 Arc 即
+    /// 放，锁序单向——`accept_lock` 永远先于 lane 锁获取）。
+    fn accept_lock(&self, task_id: &ExecTaskId) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(
+            self.accept_locks
+                .entry(task_id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .value(),
+        )
+    }
+
+    /// 受理一条任务 Thread 输入（增量 9，N12/C1）：「进程内查重
+    /// → 受理凭据 → 入队」收敛为持受理锁的单一方法，与
+    /// `try_dispatch` 的取队段互斥——跨重启重送在凭据核对不通
+    /// 过时**根本不入队**（增量 6「先入队再撤回」的窗口不复存
+    /// 在：重送项对派发永不可见）。锁内不碰 lane 锁；凭据读写
+    /// 是仅有的 await。锁内顺序（同一次持锁完成）：
+    /// 1. inbox 查重 → `Duplicate`（不触碰凭据）；
+    /// 2. 凭据写入 Ok(false)（上一进程受理过）→ 只登记进程内
+    ///    去重记忆（受理是一次性事实，后续重送静默）后返回
+    ///    `NotRecovered`——不入队、不派发，无需撤回；
+    /// 3. Ok(true) → `inbox.accept` 入队 → `Accepted`；
+    /// 4. 凭据写入 Err → warn 后仍按 `Accepted`（增量 6 既有纪
+    ///    律：不阻断受理；代价是「DB 故障 + 重启 + 平台重送」组
+    ///    合下凭据缺失会按新输入再受理——如实记录，不伪造拒收）。
+    pub async fn accept_input(
+        &self,
+        task: &ExecTask,
+        msg_id: String,
+        sender_open_id: String,
+        text: String,
+        image_keys: Vec<String>,
+    ) -> AcceptVerdict {
+        let _guard = self.accept_lock(&task.id).lock_owned().await;
+        if self.inbox.is_seen(&task.id, &msg_id) {
+            return AcceptVerdict::Duplicate;
+        }
+        if let Some(facts) = &self.facts {
+            match facts
+                .record_acceptance(&task.channel_name, &msg_id, &task.id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    // 「是否开始」（N12）：曾等待与已派发如实区分——
+                    // 两者都绝不重新执行。
+                    let started = facts
+                        .acceptance_for(&task.channel_name, &msg_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|a| a.started);
+                    self.inbox.note_seen(&task.id, &msg_id);
+                    return AcceptVerdict::NotRecovered { started };
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %e,
+                        "exec acceptance record failed; proceeding as accepted"
+                    );
+                }
+            }
+        }
+        match self
+            .inbox
+            .accept(&task.id, msg_id, sender_open_id, text, image_keys)
+        {
+            AcceptOutcome::Accepted { seq } => AcceptVerdict::Accepted { seq },
+            // 受理锁内查重后不可能撞重；防御性如实映射，不 panic。
+            AcceptOutcome::Duplicate => AcceptVerdict::Duplicate,
+        }
+    }
+
     /// 尝试派发（accept/resume/terminal 后调用）。返回是否新起了
     /// Run；Err 仅来自登记读取失败（已回滚 `Starting`，lane 可重试）。
     ///
@@ -459,7 +562,12 @@ impl ExecScheduler {
     pub async fn try_dispatch(&self, task_id: &ExecTaskId) -> Result<bool> {
         let lane = self.lane(task_id);
         // ── 锁内：C3 资格五条件 + Starting 占位（唯一裁定者）──
+        // 增量 9（N12/C1）：受理锁先于 lane 锁（全局唯一锁序，与
+        // accept_input 的「查重→凭据→入队」互斥——跨进程重送项
+        // 对派发永不可见）；持锁段内零 await（peek/占位全是同步
+        // 操作），guard 随块结束即放。
         let (input, run) = {
+            let _accept_guard = self.accept_lock(task_id).lock_owned().await;
             let mut g = lane.lock().unwrap();
             if g.paused || g.blocked_unknown {
                 return Ok(false);

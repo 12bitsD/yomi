@@ -49,7 +49,8 @@ pub struct ExecInbox {
 
 /// 单卡受理状态：队列 + 去重记忆 + 单调序号高水位。后两者在
 /// `pop_front` 后保留（进程内语义，D2）——受理是一次性事实（C1），
-/// 已消费输入的重送仍是 Duplicate，序号不因队空而重置。
+/// 已消费输入的重送仍是 Duplicate，序号不因队空而重置。去重记忆
+/// 也含「仅登记未入队」的跨进程重送项（增量 9 `note_seen`）。
 #[derive(Debug, Default)]
 struct TaskInbox {
     queue: VecDeque<AcceptedInput>,
@@ -116,17 +117,22 @@ impl ExecInbox {
             .and_then(|mut e| e.queue.pop_front())
     }
 
-    /// 撤回队中指定输入（增量 6，C1/N12：受理凭据核对不通过的回
-    /// 滚——凭据已在但本进程 inbox 无此条 = 上一进程生命周期受理
-    /// 过，刚入队的输入必须撤回，不重新入队、不派发）。去重记忆
-    /// 与序号水位保留：本进程内后续重送仍是 Duplicate（受理是一
-    /// 次性事实，撤回不等于未受理）。返回是否真的移除了排队项。
-    pub fn remove_queued(&self, task_id: &ExecTaskId, msg_id: &str) -> bool {
-        self.inner.get_mut(task_id).is_some_and(|mut e| {
-            let before = e.queue.len();
-            e.queue.retain(|i| i.msg_id != msg_id);
-            e.queue.len() != before
-        })
+    /// 进程内去重记忆查询（C1：受理是一次性事实——含已弹出项
+    /// 与仅登记未入队的跨进程重送项）。增量 9 起受理入口在凭据
+    /// 核对前先查此项（`ExecScheduler::accept_input`）。
+    pub fn is_seen(&self, task_id: &ExecTaskId, msg_id: &str) -> bool {
+        self.inner
+            .get(task_id)
+            .is_some_and(|e| e.seen.contains(msg_id))
+    }
+
+    /// 仅登记去重记忆、不入队（增量 9，C1/N12：受理凭据核对判
+    /// 定「上一进程生命周期受理过」的收口——该消息不入队、不
+    /// 派发，但受理是一次性事实：登记后本进程内后续重送仍是
+    /// Duplicate，静默不再产生任何可见动作）。序号水位不动。
+    pub fn note_seen(&self, task_id: &ExecTaskId, msg_id: &str) {
+        let mut entry = entry_or_default(&self.inner, task_id);
+        entry.seen.insert(msg_id.to_string());
     }
 
     #[cfg(test)]

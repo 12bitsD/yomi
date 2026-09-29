@@ -114,7 +114,20 @@
 - **实证补记（强化下游要求）**：s2 中被取消轮无正文 → 下一轮结果按轮序规则错配到该轮 seq——chat-flow-downstream-integration §1.2 run 身份回显硬化要求的真实佐证，不再只是推断。
 - 结论：**ExecAdapter 契约对真实双向 Provider 成立**（Kimi 路径）；Codex 路径待下游。
 
-### 后续：P5 不依赖真卡凭据的通用部分评估 —— 进行中
+### 增量 8：L1 换代状态机/Markdown 导出/CardKit 构造 —— ✅ 已验收（commit `02825993`）
+
+- 范围纪律：遵守 §7.2「P0 门槛未闭合不提前投入完整单卡产品化」——只建可验证部分；渲染 v2/局部更新/展开态待凭据。
+- 改动：`channels/taskcard/renewal.rs`（382 行，纯函数决策 + 执行 + sweep/返回两驱动）；migration v29（card_sent_at/card_entity_created_at）；`exec/export.rs`（256 行，正文字节级一致、rename 幂等）；`feishu_cardkit.rs`（113 行，三方法构造、逐方法标未实测）。
+- 验收（主 agent 独立复跑）：renewal 13/13、export 5/5、cardkit 3/3；全量 1817 过、仅 4 已知沙箱失败；clippy 65=基线；fmt 过。
+- 偏差（实施方记录 + 主 agent 当日官方文档复核确认）：`batch_update`=POST、`element content`=PUT（原规格 PUT/PATCH 组合不存在）；v29 前存量行 `card_sent_at` NULL 回退 `created_at`（保守方向）。主 agent 追加修正：content 方法正名 `cardkit_element_content_update`（原名 patch 与官方 PATCH /elements 端点混淆）。
+
+### 后续：增量 9（微窗口硬化 + harness-e2e 回归尝试）—— 进行中
+## harness-e2e 回归（工具表变更后，AGENTS.md 要求）—— ✅ 15/17，两失败均非回归
+
+- 环境建设（容器 apt 源受限全录）：sqlite3 CLI 无包→`/root/.local/bin/sqlite3` python shim；libssl-dev/protobuf-compiler 无包→镜像站抽 `libssl-dev_3.5.7` 到 `/root/.local/ssl-dev`（arch 头文件合并）、`protoc 25.8` 到 `/root/.local/protoc`（均用户级，未动系统）；链接经 `OPENSSL_DYNAMIC=1`+shim 目录。**关键坑**：容器全局 env 有 `YOMI_EXTRA_SOCKET=ws://0.0.0.0:57231`（生产占用）——测试 daemon 必须 `env -u YOMI_EXTRA_SOCKET`，否则 extra 绑定失败触发「清主 socket 文件后退出」路径（daemon 假死后连接 ENOENT、重绑 EADDRINUSE 的根因）。
+- 结果（隔离三件套 + `YOMI_DB`，debug 构建 `target/debug/yomi`）：15 过 2 失败。①verifier 未出 `VERDICT: ` 锚——jsonl 取证：子 agent 流程完整、结论正确但改写为「结论：**通过**」，模型格式 compliance flake，非代码回归；②kanban 建卡——`kb.py` 在本 pod 未安装（kanban skill 缺），纯环境缺口。
+- 另注：增量 2 实施 agent 当时声称安装的 `pkg-config/libssl-dev/protobuf-compiler` 实际均未装上（apt 源不可达）——其门禁结果依赖 cargo 缓存，已在本轮全部补齐并复核。
+
 ## 未验证项与所需条件（滚动清单）
 
 | 项 | 影响 | 所需条件 |

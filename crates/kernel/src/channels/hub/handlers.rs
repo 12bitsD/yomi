@@ -25,7 +25,7 @@ use crate::channels::hub_routing::{
 use crate::channels::{
     obs::ObsTracker, ChannelConfig, ChannelMessage, ChannelStore, PlatformAdapter, PlatformConfig,
 };
-use crate::exec::{AcceptOutcome, CreateExecTask, ExecTaskSource, ExecTaskStatus};
+use crate::exec::{AcceptVerdict, CreateExecTask, ExecTaskSource, ExecTaskStatus};
 
 pub(crate) async fn handle_incoming_message(
     channel_name: &str,
@@ -77,54 +77,35 @@ pub(crate) async fn handle_incoming_message(
             if let Some(hub) = kernel.channel_manager() {
                 hub.renew_exec_task_card_on_return(&kernel, &task).await;
             }
-            let msg_id = msg.external_message_id.clone().unwrap_or_default();
-            let outcome = kernel.exec_inbox().accept(
-                &task.id,
-                msg_id.clone(),
-                msg.external_user_id.clone(),
-                msg.raw_text.clone().unwrap_or_default(),
-                msg.image_keys.clone(),
-            );
-            match outcome {
+            // 增量 9（N12/C1）：「查重→凭据→入队」收敛为
+            // scheduler 单一方法，与并发派发共用受理锁——跨重启
+            // 重送项对派发永不可见（不再先入队再撤回）。
+            let verdict = kernel
+                .exec_scheduler()
+                .accept_input(
+                    &task,
+                    msg.external_message_id.clone().unwrap_or_default(),
+                    msg.external_user_id.clone(),
+                    msg.raw_text.clone().unwrap_or_default(),
+                    msg.image_keys.clone(),
+                )
+                .await;
+            match verdict {
                 // 重送静默：受理是一次性事实（C1），重复投递不再产
                 // 生任何可见动作。
-                AcceptOutcome::Duplicate => return Ok(None),
-                AcceptOutcome::Accepted { .. } => {
-                    // C1 完整语义（增量 6，N12）：受理凭据持久化。
-                    // 凭据已在但本进程 inbox 无此条 = 上一进程生命周
-                    // 期受理过——撤回刚入队的输入，明确回复「未恢
-                    // 复、未重新执行」；不重新入队、不派发。
-                    match kernel
-                        .exec_fact_store()
-                        .record_acceptance(channel_name, &msg_id, &task.id)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            kernel.exec_inbox().remove_queued(&task.id, &msg_id);
-                            // 「是否开始」（N12）：曾等待与已派发如
-                            // 实区分——两者都绝不重新执行。
-                            let started = kernel
-                                .exec_fact_store()
-                                .acceptance_for(channel_name, &msg_id)
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_some_and(|a| a.started);
-                            return Ok(Some(if started {
-                                "⚠️ 该输入在重启前已受理并已开始执行；不重复执行。".to_string()
-                            } else {
-                                "⚠️ 该输入在重启前已受理；等待项未恢复、未重新执行。".to_string()
-                            }));
-                        }
-                        Err(e) => {
-                            // 凭据写入失败只 warn（增量 5 事实纪律）：
-                            // 不阻断已受理输入；代价是「DB 故障 + 重
-                            // 启 + 平台重送」组合下凭据缺失会按新输
-                            // 入再受理——如实记录，不伪造拒收。
-                            warn!(error = %e, task_id = %task.id, "exec acceptance record failed; proceeding as accepted");
-                        }
-                    }
+                AcceptVerdict::Duplicate => return Ok(None),
+                // C1 完整语义（N12）：受理凭据先于本进程存在 = 上
+                // 一进程生命周期受理过——不入队、不派发，明确回复；
+                // 「是否开始」两文案保持增量 6 原文，曾等待与已派
+                // 发如实区分——两者都绝不重新执行。
+                AcceptVerdict::NotRecovered { started } => {
+                    return Ok(Some(if started {
+                        "⚠️ 该输入在重启前已受理并已开始执行；不重复执行。".to_string()
+                    } else {
+                        "⚠️ 该输入在重启前已受理；等待项未恢复、未重新执行。".to_string()
+                    }));
+                }
+                AcceptVerdict::Accepted { .. } => {
                     // 增量 4：受理后的整卡刷新统一走「快照渲染 + 串
                     // 行 PATCH」（hub 路径与事件 relay 同一渲染函数，
                     // N7）。CardPending 半完成态无卡可刷，refresh 内

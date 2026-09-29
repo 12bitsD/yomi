@@ -17,6 +17,10 @@
 //! 增量 5 起承载 Run 事实与结果正文持久化（`facts`，设计依据
 //! N7/N9/C7）：终态单向、正文一 Run 一份、迟到结果不猜最新轮。
 //!
+//! 增量 9 起任务 Thread 输入受理收敛到 `ExecScheduler::accept_input`
+//! （N12/C1）：「查重→凭据→入队」与派发取队段共用 per-task 受理锁，
+//! 跨重启重送项对派发永不可见。
+//!
 //! 命名刻意避开 `crate::tools::task`（todo 工具域），两者互不相关。
 
 use crate::types::{ExecTaskId, Result};
@@ -40,7 +44,9 @@ pub use adapter::{
 pub use facts::{ExecFactStore, ExecResultRow, ExecRunRow, SqliteExecFactStore};
 pub use inbox::{AcceptOutcome, AcceptedInput, ExecInbox};
 pub use run::{RunRecord, RunStatus};
-pub use scheduler::{ExecEvent, ExecScheduler, LaneSnapshot, ResumeOutcome, StopOutcome};
+pub use scheduler::{
+    AcceptVerdict, ExecEvent, ExecScheduler, LaneSnapshot, ResumeOutcome, StopOutcome,
+};
 pub use store::SqliteExecTaskStore;
 
 /// 执行 Provider（原生 agent 后端；P1 全程用仿真创建原生 Session）

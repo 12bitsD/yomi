@@ -1226,3 +1226,260 @@ async fn resume_failure_marks_unknown_blocked_and_keeps_binding() {
         "无新 native id（不自动重建，N2/D6）"
     );
 }
+
+// ══ chat-flow 增量 9：受理/凭据/派发微窗口硬化（N12/C1）══════
+//
+// 设计依据 docs/design/chat-flow-technical-design.md N12/C1 与
+// docs/design/chat-flow-impl/inc-9-spec.md 测试节。
+
+// ── 规格测试 2：强制交错——跨进程重送对派发永不可见 ─────────────
+//
+// 窗口形态（inc-9-spec「现状」节）：分流臂受理序列与并发
+// 「terminal 重派」交错——A 在飞、B（跨进程重送）注入的同时 A
+// 终态到达，终态后的自动重派恰落在受理窗口内。C3 单在飞 Run
+// 纪律下，A 等待中 B 排在队尾不会被派发，故窗口的 exploit 形
+// 状必须是「A 终态 → 重派取队」撞上「B 在队中」。
+#[tokio::test]
+async fn cross_restart_redelivery_never_dispatched_under_concurrent_dispatch() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "i9", &["A"]).await;
+    // A 开跑（Sim 挂起 → Running）；B 的受理凭据预置（模拟「上
+    // 一进程生命周期受理过、未开始」）——本次到达是跨进程重送。
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    assert!(facts
+        .record_acceptance("test", "i9-mB", &task.id)
+        .await
+        .unwrap());
+
+    // 强制交错（Barrier 同点起跑）：注入臂 = accept_input 全流
+    // 程；派发臂 = A 终态（terminal 内部的自动重派即 inc-6 窗口
+    // 里的并发派发方）。
+    let bar = Arc::new(tokio::sync::Barrier::new(2));
+    let injector = {
+        let sched = Arc::clone(&h.sched);
+        let task = task.clone();
+        let bar = Arc::clone(&bar);
+        tokio::spawn(async move {
+            bar.wait().await;
+            sched
+                .accept_input(
+                    &task,
+                    "i9-mB".to_string(),
+                    "ou_t".to_string(),
+                    "B".to_string(),
+                    vec![],
+                )
+                .await
+        })
+    };
+    let terminator = {
+        let sched = Arc::clone(&h.sched);
+        let bar = Arc::clone(&bar);
+        tokio::spawn(async move {
+            bar.wait().await;
+            sched.terminal(&native, TerminalKind::Completed).await;
+        })
+    };
+    let (verdict, term_done) = tokio::join!(injector, terminator);
+    term_done.unwrap();
+    assert_eq!(
+        verdict.unwrap(),
+        AcceptVerdict::NotRecovered { started: false },
+        "跨进程重送判 NotRecovered（曾等待、未开始）"
+    );
+    assert!(queue_texts(&h, &task.id).is_empty(), "B 永不进入 inbox");
+    assert_eq!(
+        started_texts(&h),
+        vec!["A"],
+        "B 永不被派发（A 终态后的重派取不到重送项）"
+    );
+
+    // 收口：进程内再次重送静默（受理是一次性事实，C1）。
+    let again = h
+        .sched
+        .accept_input(
+            &task,
+            "i9-mB".to_string(),
+            "ou_t".to_string(),
+            "B".to_string(),
+            vec![],
+        )
+        .await;
+    assert_eq!(again, AcceptVerdict::Duplicate);
+}
+
+// ── 规格测试 2 锁见证：同一跨进程重送并发到达，恰收口一次 ────────
+//
+// 受理锁守护的原子性是「查重 → 凭据 → 登记去重记忆」：无锁版本
+// 两个注入都在对方登记前通过查重（凭据读取是 await 交错点）→
+// 重复判 NotRecovered（用户收到两条「未恢复」）；有锁版本恰一
+// 次 NotRecovered + 一次静默 Duplicate。
+#[tokio::test]
+async fn concurrent_cross_restart_redeliveries_collapse_to_one_reply() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "i9d", &[]).await;
+    assert!(facts
+        .record_acceptance("test", "i9d-mB", &task.id)
+        .await
+        .unwrap());
+
+    let bar = Arc::new(tokio::sync::Barrier::new(2));
+    let mut handles = Vec::new();
+    for _ in 0..2 {
+        let sched = Arc::clone(&h.sched);
+        let task = task.clone();
+        let bar = Arc::clone(&bar);
+        handles.push(tokio::spawn(async move {
+            bar.wait().await;
+            sched
+                .accept_input(
+                    &task,
+                    "i9d-mB".to_string(),
+                    "ou_t".to_string(),
+                    "B".to_string(),
+                    vec![],
+                )
+                .await
+        }));
+    }
+    let mut not_recovered = 0;
+    let mut duplicate = 0;
+    for hd in handles {
+        match hd.await.unwrap() {
+            AcceptVerdict::NotRecovered { started } => {
+                assert!(!started);
+                not_recovered += 1;
+            }
+            AcceptVerdict::Duplicate => duplicate += 1,
+            AcceptVerdict::Accepted { .. } => panic!("跨进程重送不得判 Accepted"),
+        }
+    }
+    assert_eq!(
+        (not_recovered, duplicate),
+        (1, 1),
+        "恰一次「未恢复」+ 一次静默（受理锁收口查重原子性）"
+    );
+    assert!(h.inbox.is_empty(&task.id), "B 永不入队");
+    assert!(started_texts(&h).is_empty(), "零派发");
+}
+
+// ── 规格测试 3：accept_input 与 stop_and_pause/resume 并发 ───────
+
+#[tokio::test]
+async fn accept_input_concurrent_with_stop_and_resume_no_deadlock_then_dispatches() {
+    let (h, _pool) = harness_idle(SimAdapter::default(), 3600).await;
+    let task = make_task(&h, "i9c", &[]).await;
+
+    // 暂停态（无在飞 Run）。
+    let outcome = h.sched.stop_and_pause(&task.id, None).await;
+    assert!(matches!(
+        outcome,
+        StopOutcome::NoCurrentRun { paused: true }
+    ));
+
+    // 交错一：accept_input(B) ∥ stop_and_pause 重锤——受理锁与
+    // lane 锁不相交，5s 内必须收口（timeout 兜底死锁断言）。
+    let bar = Arc::new(tokio::sync::Barrier::new(2));
+    let acceptor = {
+        let sched = Arc::clone(&h.sched);
+        let task = task.clone();
+        let bar = Arc::clone(&bar);
+        tokio::spawn(async move {
+            bar.wait().await;
+            sched
+                .accept_input(
+                    &task,
+                    "i9c-mB".to_string(),
+                    "ou_t".to_string(),
+                    "B".to_string(),
+                    vec![],
+                )
+                .await
+        })
+    };
+    let stopper = {
+        let sched = Arc::clone(&h.sched);
+        let id = task.id.clone();
+        let bar = Arc::clone(&bar);
+        tokio::spawn(async move {
+            bar.wait().await;
+            for _ in 0..20 {
+                let _ = sched.stop_and_pause(&id, None).await;
+                tokio::task::yield_now().await;
+            }
+        })
+    };
+    let (verdict, stopper_done) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(acceptor, stopper)
+    })
+    .await
+    .expect("accept ∥ stop 5s 内收口（锁序无死锁）");
+    stopper_done.unwrap();
+    assert_eq!(
+        verdict.unwrap(),
+        AcceptVerdict::Accepted { seq: 1 },
+        "B 受理成功"
+    );
+    assert!(h.sched.snapshot(&task.id).paused, "stop 重锤后仍暂停");
+    assert_eq!(queue_texts(&h, &task.id), vec!["B"], "暂停中不派发");
+    assert!(started_texts(&h).is_empty());
+
+    // 交错二：resume 循环 ∥ accept_input(C)——Accepted 后立即可
+    // 被 resume 派发（try_dispatch 取队段与受理锁互斥，无死锁）。
+    let bar = Arc::new(tokio::sync::Barrier::new(2));
+    let resumer = {
+        let sched = Arc::clone(&h.sched);
+        let id = task.id.clone();
+        let bar = Arc::clone(&bar);
+        tokio::spawn(async move {
+            bar.wait().await;
+            for _ in 0..500 {
+                if let ResumeOutcome::Resumed { dispatched: true } = sched.resume(&id).await {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("resume 500 次内未派发出 B");
+        })
+    };
+    let acceptor_c = {
+        let sched = Arc::clone(&h.sched);
+        let task = task.clone();
+        let bar = Arc::clone(&bar);
+        tokio::spawn(async move {
+            bar.wait().await;
+            sched
+                .accept_input(
+                    &task,
+                    "i9c-mC".to_string(),
+                    "ou_t".to_string(),
+                    "C".to_string(),
+                    vec![],
+                )
+                .await
+        })
+    };
+    let (resume_done, verdict_c) = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::join!(resumer, acceptor_c)
+    })
+    .await
+    .expect("resume ∥ accept 5s 内收口（锁序无死锁）");
+    resume_done.unwrap();
+    assert_eq!(
+        verdict_c.unwrap(),
+        AcceptVerdict::Accepted { seq: 2 },
+        "C 受理成功"
+    );
+
+    // B 已被 resume 派发（Accepted 后立即可派）；C 在 B 在飞时排
+    // 队，B 终态后自动接续——受理序 = 派发序（C1 先到先得）。
+    assert_eq!(started_texts(&h), vec!["B"]);
+    assert_eq!(queue_texts(&h, &task.id), vec!["C"]);
+    let native = h.adapter.created_sessions()[0].clone();
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+    assert_eq!(started_texts(&h), vec!["B", "C"]);
+    assert!(queue_texts(&h, &task.id).is_empty());
+}
