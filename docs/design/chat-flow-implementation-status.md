@@ -128,12 +128,57 @@
 - 主 agent 复跑：exec:: 47/47、taskflow 18/18、clippy 65=基线、fmt 过。
 - 结论：增量 6 记录的 P7 硬化项关闭。
 
-### 后续：增量 10（N5/C5 当前轮问答生命周期 + ACP 真实授权验证）—— 进行中
+### 增量 10：当前轮问答生命周期（N5/C5）—— ✅ 已验收（commit `57abbab2`）
+
+- 改动：`exec/request.rs`（120 行模型）；scheduler +298（lane 请求登记簿、request_reported、answer_request 锁内核对→Submitted→锁外交付→Resolved/回滚、终态/替换/boot_sweep 失效）；`RunStatus::WaitingRequest`（is_live 占位）；卡面待回应区 + `exec_answer` 回调；ACP harness 接 request_permission 转发与 answer 回包。
+- 验收（主 agent 独立复跑）：
+  - **ACP 5/5 亲跑（kimi 2.1.0，17.1s）**：场景 5 真实授权请求→WaitingRequest→错 req Mismatch→approve_once Resolved→prompt 继续 Completed（S5_DONE 正文落库）→二次回答 Already。前 4 场景同步复跑全过。
+  - exec:: 52/52、taskflow 19/19；clippy 65=基线；fmt 过。
+- 发现（实施方记录，主 agent 复核）：kimi 2.1.0 `session/set_mode` 无 "ask" modeId，`"default"` 即 Manual approvals（configOptions 自描述）——场景 5 以此触发授权，不改 config。
+- 偏差（实施方记录，认可）：`AnswerOutcome::Submitted` 保留但同步 ack adapter 下不现（doc'd）；请求仅在 Running/WaitingRequest 受理（Starting=无原生轮次、Stopping=cancel 竞态，warn 忽略，doc'd）。
+
+### 收口：yomi 侧可独立实施项已穷尽 —— 见末节
+
 ## harness-e2e 回归（工具表变更后，AGENTS.md 要求）—— ✅ 15/17，两失败均非回归
 
 - 环境建设（容器 apt 源受限全录）：sqlite3 CLI 无包→`/root/.local/bin/sqlite3` python shim；libssl-dev/protobuf-compiler 无包→镜像站抽 `libssl-dev_3.5.7` 到 `/root/.local/ssl-dev`（arch 头文件合并）、`protoc 25.8` 到 `/root/.local/protoc`（均用户级，未动系统）；链接经 `OPENSSL_DYNAMIC=1`+shim 目录。**关键坑**：容器全局 env 有 `YOMI_EXTRA_SOCKET=ws://0.0.0.0:57231`（生产占用）——测试 daemon 必须 `env -u YOMI_EXTRA_SOCKET`，否则 extra 绑定失败触发「清主 socket 文件后退出」路径（daemon 假死后连接 ENOENT、重绑 EADDRINUSE 的根因）。
 - 结果（隔离三件套 + `YOMI_DB`，debug 构建 `target/debug/yomi`）：15 过 2 失败。①verifier 未出 `VERDICT: ` 锚——jsonl 取证：子 agent 流程完整、结论正确但改写为「结论：**通过**」，模型格式 compliance flake，非代码回归；②kanban 建卡——`kb.py` 在本 pod 未安装（kanban skill 缺），纯环境缺口。
 - 另注：增量 2 实施 agent 当时声称安装的 `pkg-config/libssl-dev/protobuf-compiler` 实际均未装上（apt 源不可达）——其门禁结果依赖 cargo 缓存，已在本轮全部补齐并复核。
+
+## 收口盘点（2026-09-30）
+
+### 已完成（全部主 agent 亲自验收，commit 在 `feat/chat-flow-impl`）
+
+| 项 | 内容 | 证据 |
+|---|---|---|
+| P0 本地可验 | 代码核查 12/12；Kimi ACP 2.1.0 探针 8 项（含跨进程恢复、不拒并发） | 本文 P0 节 + `/tmp/acp_probe*.py` |
+| P1（增量 1-2） | exec 登记核心（去重/绑定三态机/v26）；双入口创建（/task+task_create 共用契约）、Thread 分流、受理登记、占位卡 | `e70e6229` `57aa047c`，测试 21 |
+| P2（增量 3-4） | 按卡运行控制（lane 单裁定者/名额/停止恢复竞态）、卡面按钮与回调重核、事件刷新 | `cd03012b` `c4011b32`，测试 26 |
+| P4（增量 5） | Run 事实（v27）、结果 insert-once 保存、只读查询工具 | `934e6a71`，测试 8 |
+| P6（增量 6） | 重启核对（boot_sweep 标中断）、受理凭据（v28，跨重启重送「未恢复」）、空闲释放、开关收尾 | `67f269e6`，测试 15 |
+| 增量 7 | Kimi ACP 真实契约 4 场景（创建绑定/真实取消/释放恢复/两卡隔离） | `bca2a403`，主 agent 亲跑 |
+| P5 通用（增量 8） | L1 换代状态机（先确认后切换不制双卡）、Markdown 导出、CardKit 请求构造（未实测标注） | `02825993`，测试 21 |
+| 增量 9 | 受理/凭据/派发微窗口硬化（含 revert 确定性失败矩阵） | `0a86d906`，测试 3 |
+| 增量 10 | 当前轮问答生命周期（请求登记/核对/去重/失效）+ ACP 场景 5 真实授权 | `57abbab2`，主 agent 亲跑 5/5 |
+| 回归 | harness-e2e 15/17（两失败=模型 flake+环境缺 skill，均非回归）；默认套件全绿（4 沙箱存量除外）；clippy 零新增 | 本文 harness 节 |
+| 集成说明 | 下游 W3/W5 契约/能力矩阵/验收依赖成文 | `chat-flow-downstream-integration.md` |
+
+**ACP 5/5 全过（kimi 2.1.0 真实调用，17.1s）**：创建绑定/真实取消/释放跨进程恢复/两卡隔离/授权问答生命周期——ExecAdapter 契约对真实双向 Provider 成立（Kimi 路径）。
+
+### 阻塞项（不变前 loop 静默）
+
+| 项 | 解锁内容 |
+|---|---|
+| GitHub token（12bitsD/yomi 写权限） | push 实施分支、开 review PR（P7 交付面） |
+| 飞书测试应用凭据 + 测试群 | P0 真卡门槛（展开态/CardKit 实体行为/换代真机路由）、P5 渲染 v2/局部更新/附件上传、通道真链路验收 |
+| 下游 nika 接入安排 | W3 双生产 adapter（Kimi 生产版 + Codex 全量）、Skill 业务接线、W5 部署与升级验收 |
+| Codex CLI + 凭据 | 双 Provider 另一半全程 |
+
+### 遗留硬化点（已记录，随下游/P7 处理）
+
+- run 身份回显（结果归属推断在「轮合法无正文」时错配——ACP s2 实证；trait 随生产 adapter 扩展）。
+- 请求重启后重附着核实（请求随进程生命周期失效，Provider 侧重确认路径待 P7）。
+- 群聊 require_mention=true 时任务 Thread 回复需 @bot（现有闸语义，真链路验证时记录）。
 
 ## 未验证项与所需条件（滚动清单）
 
