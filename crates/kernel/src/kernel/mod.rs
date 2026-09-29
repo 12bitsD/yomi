@@ -93,6 +93,9 @@ pub struct Kernel {
     /// Exec task registry (chat-flow W1)：执行任务登记/绑定状态机
     /// 持久化。取自 `StorageSet`，不经 `Kernel::new` 参数。
     exec_task_store: Arc<dyn crate::exec::ExecTaskStore>,
+    /// Run 事实 + 结果正文 store（chat-flow W2 增量 5，N7/N9）：
+    /// 调度器是唯一写入方；只读查询工具与卡面渲染经本句柄读取。
+    exec_fact_store: Arc<dyn crate::exec::ExecFactStore>,
     /// 任务 Thread 输入的进程内受理登记（chat-flow 增量 2，D2：
     /// 重启清空）。与 `exec_scheduler` 共享同一实例。
     exec_inbox: crate::exec::ExecInbox,
@@ -159,6 +162,12 @@ impl Kernel {
     /// Get the exec task registry store (chat-flow W1).
     pub fn exec_task_store(&self) -> Arc<dyn crate::exec::ExecTaskStore> {
         self.exec_task_store.clone()
+    }
+
+    /// Run 事实 + 结果正文 store（chat-flow W2 增量 5；只读查询
+    /// 工具与卡面结果行的读取口）。
+    pub fn exec_fact_store(&self) -> Arc<dyn crate::exec::ExecFactStore> {
+        self.exec_fact_store.clone()
     }
 
     /// 任务 Thread 输入的受理登记（进程内语义，重启清空——D2）。
@@ -627,13 +636,18 @@ impl Kernel {
         let exec_adapter: Arc<dyn crate::exec::ExecAdapter> = Arc::new(exec_adapter);
         let (exec_events_tx, _) = tokio::sync::broadcast::channel(256);
         let exec_inbox = crate::exec::ExecInbox::new();
-        let exec_scheduler = Arc::new(crate::exec::ExecScheduler::new(
-            storage.exec_task_store(),
-            exec_adapter,
-            exec_inbox.clone(),
-            exec_events_tx,
-            exec_config,
-        ));
+        // 增量 5：调度器接 Run 事实 store（N7/N9）——Running 提交
+        // 与终态收口各写一条事实，结果上报先保存再公布。
+        let exec_scheduler = Arc::new(
+            crate::exec::ExecScheduler::new(
+                storage.exec_task_store(),
+                exec_adapter,
+                exec_inbox.clone(),
+                exec_events_tx,
+                exec_config,
+            )
+            .with_facts(storage.exec_fact_store()),
+        );
         // 终态回调泵 + 停止确认周期清扫（随 shutdown 拆除）。
         tokio::spawn(
             exec_scheduler
@@ -675,6 +689,7 @@ impl Kernel {
             kv_cache: storage.kv_cache(),
             channel_manager,
             exec_task_store: storage.exec_task_store(),
+            exec_fact_store: storage.exec_fact_store(),
             exec_inbox,
             exec_scheduler,
             exec_sim_control,

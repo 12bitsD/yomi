@@ -55,10 +55,14 @@ pub(crate) async fn create_and_announce(
         return Ok(AnnounceOutcome::Existing { task });
     }
 
+    // 增量 5：新建任务正常无结果行；读取失败不阻断发卡（warn
+    // + 按无结果渲染，下一事件刷新自然补齐）。
+    let latest = latest_result_or_none(kernel, &task.id).await;
     let card = task_card(
         &task,
         &kernel.exec_scheduler().snapshot(&task.id),
         task.card_generation,
+        latest.as_ref(),
     );
     let card_msg_id = match adapter.send_card(chat_id, &card, None).await {
         Ok(Some(id)) => id,
@@ -217,6 +221,21 @@ pub(crate) async fn handle_exec_action(
 async fn refresh_card(kernel: &Arc<Kernel>, task_id: &ExecTaskId) {
     if let Some(hub) = kernel.channel_manager() {
         hub.refresh_exec_task_card(kernel, task_id).await;
+    }
+}
+
+/// 读取任务最新已保存结果（增量 5 卡面结果行；读取失败只 warn，
+/// 按无结果渲染——呈现缺失不阻断卡面主流程）。
+pub(crate) async fn latest_result_or_none(
+    kernel: &Arc<Kernel>,
+    task_id: &ExecTaskId,
+) -> Option<crate::exec::ExecResultRow> {
+    match kernel.exec_fact_store().latest_result(task_id).await {
+        Ok(row) => row,
+        Err(e) => {
+            warn!(task_id = %task_id, error = %e, "exec card: latest result lookup failed");
+            None
+        }
     }
 }
 

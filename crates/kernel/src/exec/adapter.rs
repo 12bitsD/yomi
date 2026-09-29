@@ -29,11 +29,24 @@ pub enum TerminalKind {
     Cancelled,
 }
 
-/// 一条终态上报（原生身份 + 终态种类）。
-pub type TerminalNotice = (String, TerminalKind);
+/// adapter → 调度器的上报（增量 5 枚举化：终态 + 结果正文）。
+/// 经同一 mpsc 到达调度器泵，按 native id 反查归属。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdapterNotice {
+    /// 原生终态（C4）。
+    Terminal(TerminalKind),
+    /// 一轮的 Agent 原始完整正文（N9：先保存再公布；body 不改写）。
+    Result(String),
+}
 
-/// adapter → 调度器的终态回调口（C4）：构造时注入 adapter 持有；
-/// 调度器侧泵循环把每条上报转为 `ExecScheduler::terminal` 调用。
+/// 一条上报（原生身份 + 载荷）。`TerminalNotice` 是兼容别名——增
+/// 量 5 起回调通道同时承载终态与结果。
+pub type AdapterNoticeMsg = (String, AdapterNotice);
+pub type TerminalNotice = AdapterNoticeMsg;
+
+/// adapter → 调度器的回调口（C4/N9）：构造时注入 adapter 持有；
+/// 调度器侧泵循环把每条上报转为 `ExecScheduler::terminal` /
+/// `ExecScheduler::result_reported` 调用。
 /// 事件只是提示（hint），状态以 lane 锁内事实为准。
 #[derive(Clone)]
 pub struct ExecAdapterSink(mpsc::UnboundedSender<TerminalNotice>);
@@ -48,7 +61,17 @@ impl ExecAdapterSink {
     /// 上报原生终态（非阻塞；丢不了——unbounded）。
     pub fn terminal(&self, native_session_id: &str, kind: TerminalKind) {
         // 接收方已拆（调度器关停中）时静默丢弃：终态本来就只是提示。
-        let _ = self.0.send((native_session_id.to_string(), kind));
+        let _ = self
+            .0
+            .send((native_session_id.to_string(), AdapterNotice::Terminal(kind)));
+    }
+
+    /// 上报一轮结果正文（N9：原始完整正文；调度器先保存再公布）。
+    pub fn result(&self, native_session_id: &str, body: impl Into<String>) {
+        let _ = self.0.send((
+            native_session_id.to_string(),
+            AdapterNotice::Result(body.into()),
+        ));
     }
 }
 
@@ -99,6 +122,14 @@ impl SimControl {
     /// 注入「取消已确认」终态（停止未确认场景的收口驱动）。
     pub fn cancel_confirms(&self, native_session_id: &str) {
         self.report(native_session_id, TerminalKind::Cancelled);
+    }
+
+    /// 注入一轮结果正文（增量 5，N9）：经 sink 上报，调度器按
+    /// native id 反查归属 Run 后先保存再公布。
+    pub fn publish_result(&self, native_session_id: &str, body: impl Into<String>) {
+        if let Some(sink) = &self.sink {
+            sink.result(native_session_id, body);
+        }
     }
 
     /// 动态改自动完成旋钮；None 回到挂起模式。

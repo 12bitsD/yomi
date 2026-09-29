@@ -1,5 +1,6 @@
 //! ExecScheduler（chat-flow 增量 3）：按卡运行控制核心——派发、
-//! 停止/暂停、恢复、终态收口。
+//! 停止/暂停、恢复、终态收口。增量 5 起同时是 Run 事实与结果正
+//! 文的唯一写入方（N7/N9）。
 //!
 //! 设计依据 docs/design/chat-flow-technical-design.md N2/N3/N6/C3/C6/D3/D11：
 //! - N6：每卡单一控制者——lane `Mutex` 是开始/暂停/停止/恢复顺序的
@@ -16,12 +17,20 @@
 //! - D11/N3：按卡隔离，名额统一分配（`Semaphore`）、轮次间公平、
 //!   不抢占当前 Run；业务失败不自动暂停。
 //!
+//! 增量 5 事实纪律（N7/N9/C7）：
+//! - 事实写入在锁内状态提交之后、锁外执行；写入失败只 warn——不
+//!   阻断已确认的运行，查询面如实反映缺失（快照仍以 lane 为准）；
+//! - 结果上报按 native id 反查 lane/Run；反查不到（迟到、未知）
+//!   → warn 忽略，绝不归属最新轮；
+//! - `save_result` 成功（首次保存）才发 `ResultPublished` 并触发
+//!   卡面刷新——先保存再公布（N9）。
+//!
 //! 事件（`ExecEvent`，tokio broadcast）只是提示（hint）——状态唯
 //! 一事实源是 lane 锁内字段（增量 4 卡面据此刷新，不据事件推断）。
 
-use crate::exec::adapter::{ExecAdapter, TerminalKind, TerminalNotice};
+use crate::exec::adapter::{AdapterNotice, ExecAdapter, TerminalKind, TerminalNotice};
 use crate::exec::run::{RunRecord, RunStatus};
-use crate::exec::{BindingState, ExecInbox, ExecTaskStore};
+use crate::exec::{BindingState, ExecFactStore, ExecInbox, ExecTaskStore};
 use crate::types::{ExecTaskId, KernelError, Result, RunId};
 use chrono::Utc;
 use dashmap::DashMap;
@@ -52,6 +61,12 @@ pub enum ExecEvent {
         task_id: ExecTaskId,
         run_id: RunId,
     },
+    /// 一轮结果正文已保存（增量 5，N9：先保存再公布——本事件即
+    /// 「公布」，卡面据此刷新出结果行）。
+    ResultPublished {
+        task_id: ExecTaskId,
+        run_id: RunId,
+    },
 }
 
 impl ExecEvent {
@@ -63,7 +78,8 @@ impl ExecEvent {
             | Self::RunTerminal { task_id, .. }
             | Self::Paused { task_id }
             | Self::Resumed { task_id }
-            | Self::StopUnconfirmed { task_id, .. } => task_id,
+            | Self::StopUnconfirmed { task_id, .. }
+            | Self::ResultPublished { task_id, .. } => task_id,
         }
     }
 }
@@ -138,6 +154,9 @@ pub struct ExecScheduler {
     event_tx: broadcast::Sender<ExecEvent>,
     /// 停止确认超时（`exec.stop_confirm_timeout_secs`）
     stop_confirm_timeout: Duration,
+    /// Run 事实 + 结果正文持久化（增量 5，N7/N9；None = 纯内存测
+    /// 试台——事实写入整体关闭，行为与增量 3/4 一致）
+    facts: Option<Arc<dyn ExecFactStore>>,
 }
 
 impl ExecScheduler {
@@ -157,7 +176,15 @@ impl ExecScheduler {
             inbox,
             event_tx,
             stop_confirm_timeout: Duration::from_secs(config.stop_confirm_timeout_secs),
+            facts: None,
         }
+    }
+
+    /// 接 Run 事实 store（增量 5；`Kernel::new` 装配时注入）。
+    #[must_use]
+    pub fn with_facts(mut self, facts: Arc<dyn ExecFactStore>) -> Self {
+        self.facts = Some(facts);
+        self
     }
 
     /// 事件订阅口（`Kernel::exec_events` 经此暴露）。
@@ -170,8 +197,8 @@ impl ExecScheduler {
         Duration::from_secs((self.stop_confirm_timeout.as_secs() / 2).clamp(1, 30))
     }
 
-    /// adapter 终态回调泵：sink 上报逐条转 `terminal`（C4 回调
-    /// 入口；`Kernel::new` 装配时 spawn）。
+    /// adapter 回调泵：sink 上报逐条转 `terminal` / `result_reported`
+    ///（C4/N9 回调入口；`Kernel::new` 装配时 spawn）。
     pub async fn terminal_pump(
         self: Arc<Self>,
         mut rx: mpsc::UnboundedReceiver<TerminalNotice>,
@@ -183,10 +210,126 @@ impl ExecScheduler {
                 () = cancel.cancelled() => break,
                 notice = rx.recv() => {
                     match notice {
-                        Some((native, kind)) => self.terminal(&native, kind).await,
+                        Some((native, AdapterNotice::Terminal(kind))) => {
+                            self.terminal(&native, kind).await;
+                        }
+                        Some((native, AdapterNotice::Result(body))) => {
+                            self.result_reported(&native, body).await;
+                        }
                         None => break,
                     }
                 }
+            }
+        }
+    }
+
+    /// 按 native id 反查 lane（N2 一卡一绑定；`terminal` 与
+    /// `result_reported` 共用。lanes 表锁先行、取到 Arc 即放，锁
+    /// 序单向）。
+    fn find_lane_by_native(
+        &self,
+        native_session_id: &str,
+    ) -> Option<(ExecTaskId, Arc<Mutex<TaskLane>>)> {
+        for e in &self.lanes {
+            let lane = Arc::clone(e.value());
+            if lane.lock().unwrap().native_session_id.as_deref() == Some(native_session_id) {
+                return Some((e.key().clone(), lane));
+            }
+        }
+        None
+    }
+
+    /// 结果上报收口（增量 5，N9）：按 native id 反查 lane——反查
+    /// 不到（未知会话）→ warn 忽略。归属规则：上报通道只带 native
+    /// 身份不带 run 身份，而一卡单 writer 顺序执行（Provider 完成
+    /// 第 N 轮才开第 N+1 轮，正文按轮序发布），故归属本任务**最
+    /// 早一份尚无权威正文的 Run**——A 的迟到正文在 B 已成为
+    /// current 后到达仍归 A，绝不污染 B，也绝不猜「最新一轮」。
+    /// 全部 Run 已有正文 → 迟到重报，warn 忽略。保存 insert-once
+    /// 成功才发 `ResultPublished`（先保存再公布）；结果保存不改
+    /// lane 任何状态（只经 lane 定位任务归属）。
+    pub async fn result_reported(&self, native_session_id: &str, body: impl Into<String>) {
+        let Some(facts) = &self.facts else {
+            return;
+        };
+        let body = body.into();
+        let Some((task_id, _lane)) = self.find_lane_by_native(native_session_id) else {
+            tracing::warn!(
+                native_session_id,
+                "exec result for unknown native session; ignored (never attached to the latest run)"
+            );
+            return;
+        };
+        // 最早无正文的 Run（按 input_seq 升序第一份）。
+        let target = match facts.runs_for(&task_id).await {
+            Ok(runs) => {
+                let mut found = None;
+                for r in runs {
+                    match facts.result_for(&r.run_id).await {
+                        Ok(None) => {
+                            found = Some(r);
+                            break;
+                        }
+                        Ok(Some(_)) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                run_id = %r.run_id,
+                                error = %e,
+                                "exec result attribution lookup failed; not published"
+                            );
+                            return;
+                        }
+                    }
+                }
+                found
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    error = %e,
+                    "exec result attribution failed; not published"
+                );
+                return;
+            }
+        };
+        let Some(run) = target else {
+            tracing::warn!(
+                native_session_id,
+                task_id = %task_id,
+                "exec result but every run already has an authoritative body; late duplicate ignored"
+            );
+            return;
+        };
+        let meta = serde_json::json!({
+            "native_session_id": native_session_id,
+        });
+        match facts
+            .save_result(&run.run_id, &task_id, run.input_seq, &body, &meta)
+            .await
+        {
+            Ok(true) => {
+                let _ = self.event_tx.send(ExecEvent::ResultPublished {
+                    task_id: task_id.clone(),
+                    run_id: run.run_id.clone(),
+                });
+            }
+            Ok(false) => {
+                // 归属判定与保存之间的并发重报：INSERT OR IGNORE
+                // 兜底——先保存者为准，不覆盖不重发事件。
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = %run.run_id,
+                    "exec result already saved for this run; duplicate ignored (authoritative body kept)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = %run.run_id,
+                    error = %e,
+                    "exec result save failed; not published"
+                );
             }
         }
     }
@@ -333,6 +476,29 @@ impl ExecScheduler {
                         task_id: task_id.clone(),
                         run_id: run.run_id.clone(),
                     });
+                    // 增量 5（N7）：Running 提交后写 Run 开始事实，
+                    // 状态取 lane 内实际提交值（Acked 亦可能是
+                    // Stopping——Starting 在飞时停止已受理）。失败
+                    // 只 warn——不阻断已确认的运行，查询面如实反映
+                    // 缺失（lane 快照仍是状态唯一事实源）。
+                    if let Some(facts) = &self.facts {
+                        let mut rec = run.clone();
+                        rec.status = lane
+                            .lock()
+                            .unwrap()
+                            .current
+                            .as_ref()
+                            .filter(|r| r.run_id == run.run_id)
+                            .map_or(RunStatus::Running, |r| r.status);
+                        if let Err(e) = facts.run_started(&rec).await {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                run_id = %rec.run_id,
+                                error = %e,
+                                "exec run start fact write failed; run continues"
+                            );
+                        }
+                    }
                 }
                 if matches!(post, Post::CancelAfter) {
                     // C6/N6 竞态收口：Starting 在飞时受理的停止，等
@@ -371,23 +537,15 @@ impl ExecScheduler {
     /// lane（N2 一卡一绑定）；竞态如实：Stopping 中收到自然终态
     /// （Completed/Failed）保存真实终态，取消确认才记 Stopped。
     pub async fn terminal(&self, native_session_id: &str, kind: TerminalKind) {
-        // 反查 lane（ lanes 表锁先行、取到 Arc 即放，锁序单向）。
-        let mut found = None;
-        for e in &self.lanes {
-            let lane = Arc::clone(e.value());
-            if lane.lock().unwrap().native_session_id.as_deref() == Some(native_session_id) {
-                found = Some((e.key().clone(), lane));
-                break;
-            }
-        }
-        let Some((task_id, lane)) = found else {
+        let Some((task_id, lane)) = self.find_lane_by_native(native_session_id) else {
             tracing::warn!(
                 native_session_id,
                 "exec terminal for unknown native session; ignored"
             );
             return;
         };
-        {
+        // 终态事实写入载荷（锁内提交时捕获，锁外写 store）。
+        let terminal_fact = {
             let mut g = lane.lock().unwrap();
             let Some(cur) = g.current.as_mut() else {
                 tracing::warn!(
@@ -419,6 +577,7 @@ impl ExecScheduler {
             };
             cur.ended_at = Some(Utc::now());
             let run_id = cur.run_id.clone();
+            let fact = cur.clone();
             g.permit = None; // 释放名额
             g.stop_requested_at = None;
             let _ = self.event_tx.send(ExecEvent::RunTerminal {
@@ -426,6 +585,34 @@ impl ExecScheduler {
                 run_id,
                 kind,
             });
+            fact
+        };
+        // 增量 5（N7）：终态事实持久化。先 run_started（INSERT OR
+        // IGNORE 幂等）再 run_terminal——泵与 try_dispatch 并发时
+        // 保证行存在，terminal UPDATE 不落空；单向守卫在 store 侧
+        // （`terminal_kind IS NULL` 才写，重复/迟到上报不改写）。
+        // 失败只 warn：不阻断已收口的终态，查询面如实反映缺失。
+        if let Some(facts) = &self.facts {
+            let rec = terminal_fact;
+            if let Err(e) = facts.run_started(&rec).await {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = %rec.run_id,
+                    error = %e,
+                    "exec run fact backfill on terminal failed"
+                );
+            }
+            if let Err(e) = facts
+                .run_terminal(&rec.run_id, rec.status, kind, rec.ended_at.unwrap())
+                .await
+            {
+                tracing::warn!(
+                    task_id = %task_id,
+                    run_id = %rec.run_id,
+                    error = %e,
+                    "exec run terminal fact write failed; scheduler state unaffected"
+                );
+            }
         }
         // 终态后重试派发：本卡（!paused && !blocked 时业务失败也
         // 继续，N3）与可能因名额等待的他卡（名额刚释放；各 lane

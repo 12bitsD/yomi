@@ -14,6 +14,9 @@
 //! 是每卡开始/暂停/停止/恢复顺序的唯一裁定者，C3 五条件裁定派发，
 //! 停止中≠已停止，恢复不重试已停止轮，名额统一分配、按卡隔离。
 //!
+//! 增量 5 起承载 Run 事实与结果正文持久化（`facts`，设计依据
+//! N7/N9/C7）：终态单向、正文一 Run 一份、迟到结果不猜最新轮。
+//!
 //! 命名刻意避开 `crate::tools::task`（todo 工具域），两者互不相关。
 
 use crate::types::{ExecTaskId, Result};
@@ -22,13 +25,16 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 pub mod adapter;
+pub mod facts;
 pub mod inbox;
 pub mod run;
 pub mod scheduler;
 pub mod store;
 pub use adapter::{
-    ExecAdapter, ExecAdapterSink, SimAdapter, SimControl, TerminalKind, TerminalNotice,
+    AdapterNotice, ExecAdapter, ExecAdapterSink, SimAdapter, SimControl, TerminalKind,
+    TerminalNotice,
 };
+pub use facts::{ExecFactStore, ExecResultRow, ExecRunRow, SqliteExecFactStore};
 pub use inbox::{AcceptOutcome, AcceptedInput, ExecInbox};
 pub use run::{RunRecord, RunStatus};
 pub use scheduler::{ExecEvent, ExecScheduler, LaneSnapshot, ResumeOutcome, StopOutcome};

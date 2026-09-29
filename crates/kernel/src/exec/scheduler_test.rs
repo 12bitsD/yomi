@@ -9,7 +9,8 @@
 use super::*;
 use crate::exec::adapter::{ExecAdapterSink, SimAdapter};
 use crate::exec::{
-    AcceptOutcome, CreateExecTask, ExecProvider, ExecTask, ExecTaskSource, SqliteExecTaskStore,
+    AcceptOutcome, CreateExecTask, ExecProvider, ExecTask, ExecTaskSource, SqliteExecFactStore,
+    SqliteExecTaskStore,
 };
 use crate::storage::migrations::run_migrations;
 use sqlx::sqlite::SqlitePoolOptions;
@@ -20,6 +21,8 @@ struct Harness {
     adapter: Arc<SimAdapter>,
     inbox: ExecInbox,
     event_rx: broadcast::Receiver<ExecEvent>,
+    /// Run 事实 store（增量 5 测试台装配；None = 纯内存台）
+    facts: Option<Arc<SqliteExecFactStore>>,
 }
 
 async fn harness_with(
@@ -59,6 +62,7 @@ async fn harness_with(
         adapter,
         inbox,
         event_rx,
+        facts: None,
     }
 }
 
@@ -66,6 +70,43 @@ async fn harness_with(
 /// 终态由测试显式注入）。
 async fn harness(adapter: SimAdapter) -> Harness {
     harness_with(2, 30, adapter, None).await
+}
+
+/// 增量 5 测试台：任务 store 与事实 store 同库（镜像生产装配），
+/// 调度器 `.with_facts` 接事实写入。
+async fn harness_facts(adapter: SimAdapter) -> Harness {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+    let store: Arc<dyn ExecTaskStore> = Arc::new(SqliteExecTaskStore::new(pool.clone()));
+    let facts = Arc::new(SqliteExecFactStore::new(pool));
+    let inbox = ExecInbox::new();
+    let (event_tx, event_rx) = broadcast::channel(256);
+    let adapter = Arc::new(adapter);
+    let sched = Arc::new(
+        ExecScheduler::new(
+            Arc::clone(&store),
+            adapter.clone(),
+            inbox.clone(),
+            event_tx,
+            crate::config::ExecConfig {
+                max_concurrent_runs: 2,
+                stop_confirm_timeout_secs: 30,
+            },
+        )
+        .with_facts(facts.clone()),
+    );
+    Harness {
+        sched,
+        store,
+        adapter,
+        inbox,
+        event_rx,
+        facts: Some(facts),
+    }
 }
 
 /// 登记任务并按序入队输入。
@@ -653,4 +694,145 @@ async fn wait_until(desc: &str, mut pred: impl FnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for {desc}");
+}
+
+// ── 增量 5 场景 1：事实流（N7/N9）──────────────────────────────
+
+#[tokio::test]
+async fn facts_flow_terminal_one_way_result_insert_once_and_published_event() {
+    let mut h = harness_facts(SimAdapter::default()).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "f1", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+
+    // accept→dispatch：run_started 行在（Running 提交后写入）。
+    let runs = facts.runs_for(&task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].run_id, run_a.run_id);
+    assert_eq!(runs[0].input_seq, 1);
+    assert_eq!(runs[0].text, "A");
+    assert_eq!(runs[0].status, "running");
+    assert!(runs[0].terminal_kind.is_none());
+    assert!(runs[0].ended_at.is_none());
+
+    // publish_result → 正文保存 + ResultPublished 事件（先保存再
+    // 公布——事件即公布，relay 据此刷新卡面结果行）。
+    h.sched.result_reported(&native, "A 轮权威正文").await;
+    let saved = facts.result_for(&run_a.run_id).await.unwrap().unwrap();
+    assert_eq!(saved.body, "A 轮权威正文");
+    assert_eq!(saved.body_bytes, "A 轮权威正文".len() as u64);
+    assert_eq!(saved.input_seq, 1);
+    let events = drain_events(&mut h.event_rx);
+    assert!(
+        events.contains(&ExecEvent::ResultPublished {
+            task_id: task.id.clone(),
+            run_id: run_a.run_id.clone(),
+        }),
+        "{events:?}"
+    );
+
+    // 重复上报不覆盖权威正文、不重发事件（insert-once，N9）。
+    h.sched.result_reported(&native, "被篡改的正文").await;
+    let saved = facts.result_for(&run_a.run_id).await.unwrap().unwrap();
+    assert_eq!(saved.body, "A 轮权威正文", "duplicate never overwrites");
+    assert!(
+        drain_events(&mut h.event_rx)
+            .iter()
+            .all(|e| !matches!(e, ExecEvent::ResultPublished { .. })),
+        "duplicate never re-publishes"
+    );
+
+    // 停止暂停（阻断终态后重派，隔离后续 terminal 断言）→ 取消
+    // 确认 → 终态行单向写入。
+    let outcome = h
+        .sched
+        .stop_and_pause(&task.id, Some(run_a.run_id.clone()))
+        .await;
+    assert!(matches!(outcome, StopOutcome::Accepted { .. }));
+    h.sched.terminal(&native, TerminalKind::Cancelled).await;
+    let runs = facts.runs_for(&task.id).await.unwrap();
+    assert_eq!(runs[0].status, "stopped");
+    assert_eq!(runs[0].terminal_kind.as_deref(), Some("cancelled"));
+    assert!(runs[0].ended_at.is_some());
+    let ended_at = runs[0].ended_at;
+
+    // 重复 terminal（旧事件）：lane 已非在飞 → 忽略；终态行不改
+    // kind（单向——旧事件不得覆盖新事实）。
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+    let runs = facts.runs_for(&task.id).await.unwrap();
+    assert_eq!(runs[0].terminal_kind.as_deref(), Some("cancelled"));
+    assert_eq!(runs[0].status, "stopped");
+    assert_eq!(runs[0].ended_at, ended_at, "terminal fact is one-way");
+}
+
+// ── 增量 5 场景 2：隔离（迟到结果不污染新 Run）─────────────────
+
+#[tokio::test]
+async fn late_result_belongs_to_its_own_run_and_never_pollutes_current() {
+    let mut h = harness_facts(SimAdapter::default()).await;
+    let facts = h.facts.clone().unwrap();
+    let task = make_task(&h, "f2", &["A", "B"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+
+    // A 终态但正文迟到 → 未暂停，B 自动开跑（current 已是 B）。
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+    let run_b = h.sched.snapshot(&task.id).current.unwrap();
+    assert_eq!(run_b.text, "B");
+    assert_eq!(run_b.status, RunStatus::Running);
+
+    // 迟到的 A 正文到达：归 A（最早无权威正文的 Run），不污染
+    // current B（N9——迟到结果绝不猜最新轮）。
+    h.sched.result_reported(&native, "A 的迟到正文").await;
+    assert_eq!(
+        facts.result_for(&run_a.run_id).await.unwrap().unwrap().body,
+        "A 的迟到正文"
+    );
+    assert!(
+        facts.result_for(&run_b.run_id).await.unwrap().is_none(),
+        "late result must not pollute the current run"
+    );
+    let events = drain_events(&mut h.event_rx);
+    assert!(
+        events.contains(&ExecEvent::ResultPublished {
+            task_id: task.id.clone(),
+            run_id: run_a.run_id.clone(),
+        }),
+        "published for run A: {events:?}"
+    );
+
+    // B 正文到达 → 归 B；两轮各自独立。
+    h.sched.result_reported(&native, "B 的正文").await;
+    assert_eq!(
+        facts.result_for(&run_b.run_id).await.unwrap().unwrap().body,
+        "B 的正文"
+    );
+    assert_eq!(
+        facts.result_for(&run_a.run_id).await.unwrap().unwrap().body,
+        "A 的迟到正文",
+        "bodies stay independent per run"
+    );
+
+    // 全部轮次已有正文后再到 → 迟到重报，忽略不覆盖。
+    h.sched.result_reported(&native, "多余的重报").await;
+    assert_eq!(
+        facts.result_for(&run_a.run_id).await.unwrap().unwrap().body,
+        "A 的迟到正文"
+    );
+    assert_eq!(
+        facts.result_for(&run_b.run_id).await.unwrap().unwrap().body,
+        "B 的正文"
+    );
+
+    // 未知 native：warn 忽略，零写入（绝不归属最新轮）。
+    h.sched.result_reported("native-ghost", "幽灵正文").await;
+    let runs = facts.runs_for(&task.id).await.unwrap();
+    assert_eq!(runs.len(), 2);
+    assert_eq!(
+        facts.result_for(&run_b.run_id).await.unwrap().unwrap().body,
+        "B 的正文"
+    );
 }

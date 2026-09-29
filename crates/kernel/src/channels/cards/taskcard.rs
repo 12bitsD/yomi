@@ -18,11 +18,19 @@
 
 use serde_json::json;
 
-use crate::exec::{BindingState, ExecTask, ExecTaskStatus, LaneSnapshot, RunStatus};
+use crate::exec::{BindingState, ExecResultRow, ExecTask, ExecTaskStatus, LaneSnapshot, RunStatus};
 
 /// 主卡整卡 JSON（快照渲染）。`card_generation` 只进按钮 value
-/// （C9 旧代重核凭据），不参与卡面内容。
-pub(crate) fn task_card(task: &ExecTask, snap: &LaneSnapshot, card_generation: i64) -> String {
+/// （C9 旧代重核凭据），不参与卡面内容。`latest_result` 是任务最
+/// 新一份已保存的权威正文行（增量 5，N9）——存在时状态区下方
+/// 加结果行；完整结果区/附件入口/历史轮次是 P5，本增量只让
+/// 「已保存」可见。
+pub(crate) fn task_card(
+    task: &ExecTask,
+    snap: &LaneSnapshot,
+    card_generation: i64,
+    latest_result: Option<&ExecResultRow>,
+) -> String {
     let id_short = &task.id.as_str()[..12.min(task.id.as_str().len())];
     let mut elements = vec![json!({
         "tag": "markdown",
@@ -30,10 +38,12 @@ pub(crate) fn task_card(task: &ExecTask, snap: &LaneSnapshot, card_generation: i
             "- **Task**: `{id_short}` · **Provider**: `{}`\n\
              - **状态**: {}\n\
              - **队列**: {}\n\
+             {}\
              - **创建者**: `{}` · **创建**: {}",
             task.provider,
             status_line(task, snap),
             queue_line(snap),
+            result_line(latest_result),
             task.created_by,
             crate::storage::format_age(task.created_at),
         ),
@@ -97,6 +107,18 @@ fn status_line(task: &ExecTask, snap: &LaneSnapshot) -> String {
             BindingState::Broken => "⚠️ 绑定损坏".to_string(),
         },
     }
+}
+
+/// 结果区一行（增量 5，N9）：有已保存正文时如实显示「已保存 +
+/// 轮次 + 字节数」；正文不入卡（完整结果区/附件入口是 P5）。无
+/// 结果时为空串（不占行）。
+fn result_line(latest: Option<&ExecResultRow>) -> String {
+    latest.map_or_else(String::new, |r| {
+        format!(
+            "- **结果**: 📄 第 {} 轮结果已保存（{} 字节）\n",
+            r.input_seq, r.body_bytes
+        )
+    })
 }
 
 /// 队列区一行（D2 标签保留：进程内受理，重启不保留）。
@@ -241,6 +263,11 @@ mod tests {
         }
     }
 
+    /// 无结果行的渲染捷径（既有增量 4 场景与结果区无关）。
+    fn render(task: &ExecTask, snap: &LaneSnapshot, gen: i64) -> String {
+        task_card(task, snap, gen, None)
+    }
+
     /// 卡面全部按钮的 callback value（解析整卡 JSON）。
     fn button_values(card: &str) -> Vec<serde_json::Value> {
         let parsed: serde_json::Value = serde_json::from_str(card).unwrap();
@@ -261,16 +288,16 @@ mod tests {
     fn idle_card_renders_binding_states_and_queue_honestly() {
         // 三态文案严格区分（N2：待初始化 ≠ 损坏 ≠ 已绑定）。
         let idle = snap(None, 0, false, false);
-        let uninit = task_card(&task(BindingState::Uninitialized), &idle, 0);
+        let uninit = render(&task(BindingState::Uninitialized), &idle, 0);
         assert!(uninit.contains("已登记 · 待初始化"), "{uninit}");
         assert!(!uninit.contains("绑定损坏"), "{uninit}");
-        let broken = task_card(&task(BindingState::Broken), &idle, 0);
+        let broken = render(&task(BindingState::Broken), &idle, 0);
         assert!(broken.contains("绑定损坏"), "{broken}");
-        let bound = task_card(&task(BindingState::Bound), &idle, 0);
+        let bound = render(&task(BindingState::Bound), &idle, 0);
         assert!(bound.contains("已绑定"), "{bound}");
 
         // 队列区如实标注进程内语义（D2：重启不保留）。
-        let card = task_card(
+        let card = render(
             &task(BindingState::Uninitialized),
             &snap(None, 3, false, false),
             0,
@@ -296,7 +323,7 @@ mod tests {
         let t = task(BindingState::Bound);
         let r = run(3, RunStatus::Running);
         let run_id = r.run_id.as_str().to_string();
-        let card = task_card(&t, &snap(Some(r), 1, false, false), 7);
+        let card = render(&t, &snap(Some(r), 1, false, false), 7);
         assert!(card.contains("执行中 · 第 3 轮"), "{card}");
         // 未暂停：只有 ⏹，value 含 task/run/gen 三字段（C9 重核凭据）。
         let values = button_values(&card);
@@ -314,7 +341,7 @@ mod tests {
 
     #[test]
     fn stopping_card_blocks_all_buttons() {
-        let card = task_card(
+        let card = render(
             &task(BindingState::Bound),
             &snap(Some(run(2, RunStatus::Stopping)), 1, true, false),
             0,
@@ -326,19 +353,19 @@ mod tests {
 
     #[test]
     fn terminal_cards_report_truthfully() {
-        let stopped = task_card(
+        let stopped = render(
             &task(BindingState::Bound),
             &snap(Some(run(4, RunStatus::Stopped)), 0, true, false),
             0,
         );
         assert!(stopped.contains("已停止 · 第 4 轮"), "{stopped}");
-        let completed = task_card(
+        let completed = render(
             &task(BindingState::Bound),
             &snap(Some(run(4, RunStatus::Completed)), 0, false, false),
             0,
         );
         assert!(completed.contains("第 4 轮已结束（完成）"), "{completed}");
-        let failed = task_card(
+        let failed = render(
             &task(BindingState::Bound),
             &snap(Some(run(4, RunStatus::Failed)), 0, false, false),
             0,
@@ -350,7 +377,7 @@ mod tests {
 
     #[test]
     fn unknown_card_marks_recheck_and_blocks_buttons() {
-        let card = task_card(&task(BindingState::Bound), &snap(None, 2, false, true), 0);
+        let card = render(&task(BindingState::Bound), &snap(None, 2, false, true), 0);
         assert!(card.contains("⚠️ 状态待核对（已阻断后续派发）"), "{card}");
         assert!(button_values(&card).is_empty(), "blocked 不出按钮");
     }
@@ -358,7 +385,7 @@ mod tests {
     #[test]
     fn paused_card_marks_queue_and_offers_resume() {
         // queued>0 + paused → 队列标注「已暂停」+ ▶（run 为 null）。
-        let card = task_card(&task(BindingState::Bound), &snap(None, 2, true, false), 5);
+        let card = render(&task(BindingState::Bound), &snap(None, 2, true, false), 5);
         assert!(card.contains("已暂停 · 进程内 · 重启不保留"), "{card}");
         let values = button_values(&card);
         assert_eq!(values.len(), 1, "{card}");
@@ -373,7 +400,7 @@ mod tests {
         );
         assert!(!values[0]["task"].as_str().unwrap().is_empty());
         // 空队列 + paused：不标注「已暂停」，▶ 仍在（无论有无 current）。
-        let empty = task_card(&task(BindingState::Bound), &snap(None, 0, true, false), 5);
+        let empty = render(&task(BindingState::Bound), &snap(None, 0, true, false), 5);
         assert!(!empty.contains("已暂停"), "{empty}");
         assert_eq!(button_values(&empty).len(), 1, "{empty}");
     }
@@ -382,7 +409,7 @@ mod tests {
     fn archived_card_shows_no_buttons() {
         let mut t = task(BindingState::Bound);
         t.status = ExecTaskStatus::Archived;
-        let card = task_card(
+        let card = render(
             &t,
             &snap(Some(run(1, RunStatus::Running)), 1, true, false),
             0,
@@ -399,5 +426,40 @@ mod tests {
         let excerpt = goal_excerpt(&long);
         assert_eq!(excerpt.chars().count(), 31, "30 字 + 省略号");
         assert!(excerpt.ends_with('…'));
+    }
+
+    // ── 增量 5：结果行（N9：只让「已保存」可见，正文不入卡）─────
+
+    #[test]
+    fn result_line_shows_saved_marker_and_hides_body() {
+        let row = ExecResultRow {
+            run_id: RunId::new(),
+            task_id: ExecTaskId::new(),
+            input_seq: 2,
+            body: "正文不应出现在卡面".into(),
+            body_bytes: 1234,
+            meta: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        let card = task_card(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
+            0,
+            Some(&row),
+        );
+        assert!(card.contains("第 2 轮结果已保存（1234 字节）"), "{card}");
+        assert!(card.contains("📄"), "{card}");
+        assert!(
+            !card.contains("正文不应出现在卡面"),
+            "结果行只显示已保存标记，不带正文"
+        );
+        // 无结果：不占行（既有形态不变）。
+        let plain = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
+            0,
+        );
+        assert!(!plain.contains("结果已保存"), "{plain}");
+        assert!(!plain.contains("**结果**"), "{plain}");
     }
 }

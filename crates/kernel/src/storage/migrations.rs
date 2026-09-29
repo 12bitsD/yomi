@@ -8,7 +8,7 @@ use sqlx::sqlite::SqlitePool;
 use tracing::{info, warn};
 
 /// Current schema version - bump this when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 26;
+pub const CURRENT_SCHEMA_VERSION: i64 = 27;
 
 /// A single database migration (can contain multiple SQL statements)
 struct Migration {
@@ -348,6 +348,39 @@ const MIGRATIONS: &[Migration] = &[
             );",
             r"CREATE UNIQUE INDEX idx_exec_tasks_dedup ON exec_tasks(channel_name, dedup_key);",
             r"CREATE INDEX idx_exec_tasks_thread ON exec_tasks(thread_root_msg_id);",
+        ],
+    },
+    Migration {
+        version: 27,
+        // chat-flow W2 增量 5：Run 关键事实（N7）+ 按 Run 保存的权
+        // 威结果正文（N9，先保存再公布）。`terminal_kind` 终态一次性
+        // 写入之后拒改（单向）；`exec_results` 一 Run 一份正文，重复
+        // 上报 INSERT OR IGNORE 不覆盖。
+        name: "add_exec_run_facts",
+        sqls: &[
+            r"CREATE TABLE exec_runs (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES exec_tasks(id),
+                input_seq INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                text TEXT NOT NULL,
+                image_keys TEXT NOT NULL DEFAULT '[]',
+                terminal_kind TEXT,
+                started_at DATETIME NOT NULL,
+                ended_at DATETIME,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+            r"CREATE INDEX idx_exec_runs_task ON exec_runs(task_id, input_seq);",
+            r"CREATE TABLE exec_results (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES exec_tasks(id),
+                input_seq INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                body_bytes INTEGER NOT NULL,
+                meta TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+            r"CREATE INDEX idx_exec_results_task ON exec_results(task_id, input_seq);",
         ],
     },
 ];

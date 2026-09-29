@@ -70,7 +70,10 @@ pub(crate) async fn refresh_task_card(
         None => return,
     };
     let snap = kernel.exec_scheduler().snapshot(task_id);
-    let card = task_card(&task, &snap, task.card_generation);
+    // 增量 5（N9）：结果行事实在同一 per-task 锁内读取——快照语
+    // 义不变，渲染依据仍是「锁内重读的事实」，事件只是提示。
+    let latest = super::latest_result_or_none(kernel, task_id).await;
+    let card = task_card(&task, &snap, task.card_generation, latest.as_ref());
     if let Err(e) = adapter.update_card(&card_msg_id, &card).await {
         // PATCH 失败只 warn：呈现待同步，不反向改任务状态，不重试
         // （下一事件自然带来新快照——无重试风暴，C9）。

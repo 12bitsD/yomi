@@ -22,6 +22,7 @@ pub mod sleep;
 pub mod subagent;
 pub mod task;
 pub mod task_create;
+pub mod task_status;
 pub mod todo;
 #[cfg(feature = "websearch")]
 pub mod websearch;
@@ -46,6 +47,9 @@ pub use skill_load::{SkillTool, SKILL_FILENAME, SKILL_TOOL_NAME};
 pub use sleep::{SleepTool, SLEEP_TOOL_NAME};
 pub use subagent::{SubagentTool, SUBAGENT_TOOL_NAME};
 pub use task_create::{TaskCreateTool, TASK_CREATE_TOOL_NAME};
+pub use task_status::{
+    TaskResultTool, TaskStatusTool, TASK_RESULT_TOOL_NAME, TASK_STATUS_TOOL_NAME,
+};
 pub use todo::{TodoTool, TODO_TOOL_NAME};
 #[cfg(feature = "websearch")]
 pub use websearch::WebSearchTool;
@@ -397,6 +401,15 @@ impl ToolRegistry {
                 config.shared.channel_hub.clone(),
                 config.shared.kernel_weak(),
             ));
+            // task_status / task_result（chat-flow W2 增量 5，N7/C7）：
+            // 只读进度/结果查询——与 task_create 同条件注册。两工具
+            // 只读 store + lane 快照，不调调度器写方法、不联系
+            // adapter、不创建 Run。
+            self.register(TaskStatusTool::new(
+                config.shared.channel_hub.clone(),
+                config.shared.kernel_weak(),
+            ));
+            self.register(TaskResultTool::new(config.shared.kernel_weak()));
         }
 
         // ask_user 整体下线（2026-08）：交互价值不抵问题（多题聚合、
