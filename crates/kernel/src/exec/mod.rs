@@ -24,6 +24,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+pub mod acp_harness;
 pub mod adapter;
 pub mod facts;
 pub mod inbox;
