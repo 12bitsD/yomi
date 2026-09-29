@@ -64,6 +64,7 @@ fn lane(current: Option<RunStatus>, queued: usize, paused: bool) -> LaneSnapshot
         queued,
         blocked_unknown: false,
         released: false,
+        pending_request: None,
     }
 }
 

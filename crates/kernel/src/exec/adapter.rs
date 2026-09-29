@@ -15,7 +15,14 @@
 //!
 //! P1 全程只有 [`SimAdapter`]（标注：P3 由真实双 Provider adapter
 //! 替换）；生产装配默认挂起模式——无真实 Provider 时不伪造进展。
+//!
+//! 增量 10 追加（N5/C5/D10）：
+//! - `AdapterNotice::Request`：Provider 当前轮明确发出的原生提问/
+//!   授权请求上报（只登记原生明确发出的请求，正文提问不伪造）；
+//! - `ExecAdapter::answer`：把回答交付原生侧。能力不支持某回答形
+//!   态（如自由文本）时如实返回错误，不伪装（C5）。
 
+use crate::exec::request::{ExecRequestKind, ExecRequestOption, RequestOutcome};
 use crate::exec::{AcceptedInput, ExecTask};
 use crate::types::Result;
 use async_trait::async_trait;
@@ -35,14 +42,24 @@ pub enum TerminalKind {
     Cancelled,
 }
 
-/// adapter → 调度器的上报（增量 5 枚举化：终态 + 结果正文）。
-/// 经同一 mpsc 到达调度器泵，按 native id 反查归属。
+/// adapter → 调度器的上报（增量 5 枚举化：终态 + 结果正文；增量
+/// 10 加当前轮问答请求）。经同一 mpsc 到达调度器泵，按 native id
+/// 反查归属。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AdapterNotice {
     /// 原生终态（C4）。
     Terminal(TerminalKind),
     /// 一轮的 Agent 原始完整正文（N9：先保存再公布；body 不改写）。
     Result(String),
+    /// 当前轮问答请求（增量 10，N5/C5）：Provider 明确发出、当前
+    /// Run 仍在等待的原生请求。`native_ref` 是原生请求身份，回答
+    /// 时经 `ExecAdapter::answer` 原样回传。
+    Request {
+        native_ref: String,
+        kind: ExecRequestKind,
+        prompt_text: String,
+        options: Vec<ExecRequestOption>,
+    },
 }
 
 /// 一条上报（原生身份 + 载荷）。`TerminalNotice` 是兼容别名——增
@@ -79,6 +96,27 @@ impl ExecAdapterSink {
             AdapterNotice::Result(body.into()),
         ));
     }
+
+    /// 上报当前轮问答请求（增量 10，N5/C5：Provider 明确发出的原
+    /// 生请求；模型普通正文提问不得经此伪造请求）。
+    pub fn request(
+        &self,
+        native_session_id: &str,
+        native_ref: String,
+        kind: ExecRequestKind,
+        prompt_text: String,
+        options: Vec<ExecRequestOption>,
+    ) {
+        let _ = self.0.send((
+            native_session_id.to_string(),
+            AdapterNotice::Request {
+                native_ref,
+                kind,
+                prompt_text,
+                options,
+            },
+        ));
+    }
 }
 
 /// 执行 adapter（原生 agent 后端接缝）。
@@ -99,6 +137,19 @@ pub trait ExecAdapter: Send + Sync {
     /// 不影响别的任务；恢复由调用方用原身份 `start_run`（原生侧
     /// load/resume，sim 即同 id `start_run`）。
     async fn release(&self, native_session_id: &str) -> Result<()>;
+
+    /// 交付一条问答请求的回答（增量 10，N5/C5）：`native_ref` 是
+    /// 上报时的原生请求身份，原样回传。返回 Ok = 回答已交付原生
+    /// 侧（adapter 确认，请求方可标 Resolved——已提交≠已接收，
+    /// 以本确认为准）；Err = 未确认交付，调用方回滚待答状态。
+    /// 能力不支持某回答形态（如自由文本）时如实返回错误，不伪
+    /// 装、不转成别的形态。
+    async fn answer(
+        &self,
+        native_session_id: &str,
+        native_ref: &str,
+        outcome: RequestOutcome,
+    ) -> Result<()>;
 }
 
 /// `SimAdapter` 的共享控制柄（chat-flow 增量 4，Arc 共享、clone
@@ -122,6 +173,15 @@ pub struct SimControl {
     /// 用」，走 Unknown + `blocked_unknown` 如实阻断路径（不静默新
     /// 建 Session）。
     resume_fails: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// 回答观察口（增量 10：adapter 已收到的 answer，按序；
+    /// (native 身份, 原生请求身份, 回答载荷)）
+    answered: Arc<Mutex<Vec<(String, String, RequestOutcome)>>>,
+    /// 回答即终态旋钮（增量 10）：answer 交付后经 sink 报
+    /// Completed——模拟「回答后 Provider 继续并跑完本轮」。
+    auto_resolve_on_answer: Arc<AtomicBool>,
+    /// 下一次 `answer` 返回 Err 一次（交付未确认的回滚场景；随
+    /// 后自动复位）
+    fail_next_answer: Arc<AtomicBool>,
 }
 
 impl SimControl {
@@ -166,6 +226,42 @@ impl SimControl {
             .lock()
             .unwrap()
             .insert(native_session_id.to_string());
+    }
+
+    /// 注入一条当前轮问答请求（增量 10，N5/C5：经 sink 上报，与
+    /// 真实 adapter 同一通路——不在调用返回里直接改调度器状态）。
+    pub fn raise_request(
+        &self,
+        native_session_id: &str,
+        kind: ExecRequestKind,
+        prompt_text: impl Into<String>,
+        options: Vec<ExecRequestOption>,
+    ) {
+        if let Some(sink) = &self.sink {
+            sink.request(
+                native_session_id,
+                format!("sim-req-{}", ulid::Ulid::new()),
+                kind,
+                prompt_text.into(),
+                options,
+            );
+        }
+    }
+
+    /// 测试观察口：adapter 已收到的 answer（按序）。
+    pub fn answered_requests(&self) -> Vec<(String, String, RequestOutcome)> {
+        self.answered.lock().unwrap().clone()
+    }
+
+    /// 开/关「回答即终态」旋钮：answer 交付后经 sink 报 Completed。
+    pub fn set_auto_resolve_on_answer(&self, on: bool) {
+        self.auto_resolve_on_answer.store(on, Ordering::Release);
+    }
+
+    /// 让下一次 `answer` 失败一次（交付未确认 → 调度器回滚待答状
+    /// 态的场景）。
+    pub fn fail_next_answer(&self) {
+        self.fail_next_answer.store(true, Ordering::Release);
     }
 
     fn report(&self, native_session_id: &str, kind: TerminalKind) {
@@ -339,6 +435,33 @@ impl ExecAdapter for SimAdapter {
             .lock()
             .unwrap()
             .push(native_session_id.to_string());
+        Ok(())
+    }
+
+    async fn answer(
+        &self,
+        native_session_id: &str,
+        native_ref: &str,
+        outcome: RequestOutcome,
+    ) -> Result<()> {
+        // 交付未确认旋钮：如实 Err（调度器回滚待答状态，C5）。
+        if self.control.fail_next_answer.swap(false, Ordering::AcqRel) {
+            return Err(crate::types::KernelError::task(
+                "sim adapter: answer failed (fail_next_answer armed)",
+            ));
+        }
+        self.control.answered.lock().unwrap().push((
+            native_session_id.to_string(),
+            native_ref.to_string(),
+            outcome,
+        ));
+        // 「回答即终态」旋钮：交付后经 sink 报 Completed（C4：终态
+        // 不在 answer 返回里冒充）。
+        if self.control.auto_resolve_on_answer.load(Ordering::Acquire) {
+            if let Some(sink) = &self.sink {
+                sink.terminal(native_session_id, TerminalKind::Completed);
+            }
+        }
         Ok(())
     }
 }

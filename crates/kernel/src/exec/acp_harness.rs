@@ -22,6 +22,16 @@
 //!   自动回 allow 选项（free-tokens 配置 `permission_mode=auto`，正
 //!   常不触发，按 spec 兜底处理）。
 //!
+//! 增量 10 追加（N5/C5，场景 5）：
+//! - `enable_permission_ask` 旋钮：新进程 `session/new`/`session/load`
+//!   后调 `session/set_mode {modeId:"default"}`（实测 kimi 2.1.0：
+//!   default = Manual approvals——ACP 无 "ask" modeId），此后
+//!   `session/request_permission` 不再自动应答，如实转
+//!   `AdapterNotice::Request`（`native_ref` = JSON-RPC 请求 id 的序
+//!   列化形态）；`answer` 把选定 optionId 回写为 JSON-RPC result
+//!   （`Rejected` → `cancelled`；自由文本无此能力，如实报错不伪
+//!   装）。
+//!
 //! 已知简化（测试接入可承载，生产 adapter 不得照抄）：
 //! - 正文 = prompt 期间收到的 `agent_message_chunk` 拼接；上一轮
 //!   迟到的 chunk 可能混入下一轮正文（套件断言一律 contains 语
@@ -31,13 +41,14 @@
 //!   走 `session/load`（C8：关闭资源不删除历史）。
 
 use crate::exec::adapter::{ExecAdapter, ExecAdapterSink, TerminalKind};
+use crate::exec::request::{ExecOptionKind, ExecRequestKind, ExecRequestOption, RequestOutcome};
 use crate::exec::{AcceptedInput, ExecTask};
 use crate::types::{ExecTaskId, KernelError, Result};
 use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -65,12 +76,19 @@ struct AcpProcess {
     notify_tx: broadcast::Sender<Value>,
     /// stdout 读循环
     reader: JoinHandle<()>,
+    /// 请求上报口（增量 10：转发模式下 `session/request_permission`
+    /// 经此进调度器，与 adapter 同口）
+    sink: ExecAdapterSink,
+    /// 授权请求转发旋钮（增量 10 场景 5）：on = 不自动应答，如实
+    /// 转 `AdapterNotice::Request` 等人工回答（C5）；off = 场景
+    /// 1–4 既有自动 allow 兜底。
+    forward_permissions: AtomicBool,
 }
 
 impl AcpProcess {
     /// 起 `kimi acp` 子进程并挂读循环（`kill_on_drop` 兜底防泄漏；
     /// 进程工作目录即 Session cwd）。
-    fn spawn(cwd: &Path) -> Result<Arc<Self>> {
+    fn spawn(cwd: &Path, sink: ExecAdapterSink) -> Result<Arc<Self>> {
         let mut child = Command::new("kimi")
             .arg("acp")
             .current_dir(cwd)
@@ -98,6 +116,8 @@ impl AcpProcess {
                 pending: DashMap::new(),
                 notify_tx,
                 reader,
+                sink,
+                forward_permissions: AtomicBool::new(false),
             }
         }))
     }
@@ -187,14 +207,22 @@ impl AcpProcess {
         Ok(())
     }
 
-    /// agent→client 请求自动应答：`session/request_permission` 回
-    /// allow 选项（优先 `allow_once`）；未实现的方法如实回
-    /// method-not-found（不冒充支持）。
+    /// agent→client 请求处置：`session/request_permission` 在转发
+    /// 模式（增量 10 场景 5）下如实转 `AdapterNotice::Request` 等
+    /// 人工回答（不自动应答——agent 悬挂即 C5「等回答占有
+    /// Session」语义）；否则回 allow 选项（优先 `allow_once`）；
+    /// 未实现的方法如实回 method-not-found（不冒充支持）。
     async fn answer_agent_request(&self, msg: &Value) {
         let Some(id) = msg.get("id").cloned() else {
             return;
         };
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        if method == "session/request_permission"
+            && self.forward_permissions.load(Ordering::Acquire)
+            && self.forward_permission_request(&id, msg)
+        {
+            return;
+        }
         let resp = if method == "session/request_permission" {
             let options = msg["params"]["options"].as_array();
             let chosen = options.and_then(|opts| {
@@ -229,6 +257,63 @@ impl AcpProcess {
         if let Err(e) = self.write_line(&resp).await {
             tracing::warn!(method, error = %e, "acp harness: answer to agent request lost");
         }
+    }
+
+    /// 转发一条 `session/request_permission` 为调度器问答请求（增
+    /// 量 10，N5/C5）：`native_ref` = JSON-RPC 请求 id 的序列化形
+    /// 态（`answer` 反解回原 id 回写 result）；摘要取 toolCall 原
+    /// 文；选项原样映射（reject 不美化）。载荷缺 sessionId 时如
+    /// 实返回 false（调用方回落自动应答，不悬挂 agent）。
+    fn forward_permission_request(&self, id: &Value, msg: &Value) -> bool {
+        let params = &msg["params"];
+        let Some(session) = params["sessionId"].as_str() else {
+            tracing::warn!("acp harness: request_permission without sessionId; auto-answering");
+            return false;
+        };
+        let tool = &params["toolCall"];
+        let title = tool["title"].as_str().unwrap_or_default();
+        let mut detail = String::new();
+        if let Some(contents) = tool["content"].as_array() {
+            for c in contents {
+                if let Some(text) = c["content"]["text"].as_str() {
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(text);
+                }
+            }
+        }
+        let prompt_text = match (title.is_empty(), detail.is_empty()) {
+            (false, false) => format!("{title}: {detail}"),
+            (false, true) => title.to_string(),
+            _ => detail,
+        };
+        let options = params["options"]
+            .as_array()
+            .map(|opts| {
+                opts.iter()
+                    .filter_map(|o| {
+                        let option_id = o["optionId"].as_str()?.to_string();
+                        Some(ExecRequestOption {
+                            label: o["name"].as_str().unwrap_or(&option_id).to_string(),
+                            kind: ExecOptionKind::from_native(
+                                o["kind"].as_str().unwrap_or_default(),
+                            ),
+                            option_id,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let native_ref = serde_json::to_string(id).unwrap_or_else(|_| "null".to_string());
+        self.sink.request(
+            session,
+            native_ref,
+            ExecRequestKind::Permission,
+            prompt_text,
+            options,
+        );
+        true
     }
 
     /// 失败全部在飞请求（进程退出/release 时）：等待方如实收到
@@ -406,6 +491,12 @@ pub struct AcpHarnessAdapter {
     cwds: DashMap<String, PathBuf>,
     /// 测试观察口：(native id, 输入原文) 按序
     started: Mutex<Vec<(String, String)>>,
+    /// 授权请求转人工回答旋钮（增量 10 场景 5）：on = 新进程
+    /// `session/new`/`session/load` 后置 manual-approval 模式
+    ///（`session/set_mode {modeId:"default"}`——实测 kimi 2.1.0
+    /// 无 "ask" modeId，default 即 Manual approvals），该进程
+    /// `session/request_permission` 转调度器等人工回答。
+    ask_mode: AtomicBool,
 }
 
 impl AcpHarnessAdapter {
@@ -415,6 +506,7 @@ impl AcpHarnessAdapter {
             procs: DashMap::new(),
             cwds: DashMap::new(),
             started: Mutex::new(Vec::new()),
+            ask_mode: AtomicBool::new(false),
         }
     }
 
@@ -436,7 +528,7 @@ impl AcpHarnessAdapter {
             native_id,
             "acp harness: respawning process + session/load (resume after release)"
         );
-        let proc = AcpProcess::spawn(&cwd)?;
+        let proc = AcpProcess::spawn(&cwd, self.sink.clone())?;
         proc.initialize().await?;
         proc.request(
             "session/load",
@@ -447,8 +539,33 @@ impl AcpHarnessAdapter {
             }),
         )
         .await?;
+        self.arm_ask_mode(&proc, native_id).await?;
         self.procs.insert(native_id.to_string(), Arc::clone(&proc));
         Ok(proc)
+    }
+
+    /// 场景 5 旋钮：授权请求转人工回答模式（须在 `create_session`
+    /// 之前开启——此后新起的进程都置 manual-approval 并转发请求）。
+    pub fn enable_permission_ask(&self) {
+        self.ask_mode.store(true, Ordering::Release);
+    }
+
+    /// ask 模式下武装进程（增量 10）：manual-approval + 请求转发。
+    /// `session/set_mode` 失败如实 Err——不伪装已生效。
+    async fn arm_ask_mode(&self, proc: &AcpProcess, native_id: &str) -> Result<()> {
+        if !self.ask_mode.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        proc.request(
+            "session/set_mode",
+            serde_json::json!({
+                "sessionId": native_id,
+                "modeId": "default",
+            }),
+        )
+        .await?;
+        proc.forward_permissions.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// 测试观察口：已收到的 `start_run`（native id, 输入原文）。
@@ -479,7 +596,7 @@ impl ExecAdapter for AcpHarnessAdapter {
         tokio::fs::create_dir_all(&cwd).await.map_err(|e| {
             KernelError::task(format!("acp harness: create cwd {}: {e}", cwd.display()))
         })?;
-        let proc = AcpProcess::spawn(&cwd)?;
+        let proc = AcpProcess::spawn(&cwd, self.sink.clone())?;
         proc.initialize().await?;
         let result = proc
             .request(
@@ -491,6 +608,7 @@ impl ExecAdapter for AcpHarnessAdapter {
             .as_str()
             .ok_or_else(|| KernelError::task("acp harness: session/new without sessionId"))?
             .to_string();
+        self.arm_ask_mode(&proc, &session).await?;
         self.cwds.insert(session.clone(), cwd);
         self.procs.insert(session.clone(), proc);
         Ok(session)
@@ -560,6 +678,47 @@ impl ExecAdapter for AcpHarnessAdapter {
             proc.kill().await;
         }
         Ok(())
+    }
+
+    async fn answer(
+        &self,
+        native_session_id: &str,
+        native_ref: &str,
+        outcome: RequestOutcome,
+    ) -> Result<()> {
+        // 进程不在表（已释放/从未绑定）：无从交付——如实 Err（调
+        // 度器回滚待答，C5：不伪装已接收）。
+        let proc = self
+            .procs
+            .get(native_session_id)
+            .map(|p| Arc::clone(&p))
+            .ok_or_else(|| KernelError::task("acp harness: answer for a released/gone session"))?;
+        let id: Value = serde_json::from_str(native_ref).map_err(|e| {
+            KernelError::task(format!("acp harness: bad native_ref {native_ref:?}: {e}"))
+        })?;
+        let result = match outcome {
+            // 原生选定（allow/reject 选项都是原生语义——拒绝不变成
+            // 同意）。
+            RequestOutcome::Selected { option_id } => {
+                serde_json::json!({"outcome": {"outcome": "selected", "optionId": option_id}})
+            }
+            // 原生整体拒绝路径。
+            RequestOutcome::Rejected => {
+                serde_json::json!({"outcome": {"outcome": "cancelled"}})
+            }
+            // request_permission 无自由文本能力（能力矩阵如实）。
+            RequestOutcome::FreeText { .. } => {
+                return Err(KernelError::task(
+                    "acp harness: session/request_permission has no free-text capability",
+                ));
+            }
+        };
+        proc.write_line(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        }))
+        .await
     }
 }
 

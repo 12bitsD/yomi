@@ -1483,3 +1483,361 @@ async fn accept_input_concurrent_with_stop_and_resume_no_deadlock_then_dispatche
     assert_eq!(started_texts(&h), vec!["B", "C"]);
     assert!(queue_texts(&h, &task.id).is_empty());
 }
+
+// ── 增量 10：当前轮问答请求生命周期（N5/C5/D10）──────────────
+//
+// 设计依据 docs/design/chat-flow-technical-design.md N5/C5/D10：
+// 只登记 Provider 明确发出的原生请求；回答逐维核对、一次请求只
+// 一个最终回应（Submitted ≠ Resolved）；终态/替换后请求失效——
+// 不批准新操作、不转新 Prompt；等回答的 Run 仍占有 Session。
+
+use crate::exec::request::{ExecOptionKind, ExecRequestKind, ExecRequestOption};
+
+/// 授权请求选项（allow_once / reject_once 两枚，镜像 ACP 形态）。
+fn perm_options() -> Vec<ExecRequestOption> {
+    vec![
+        ExecRequestOption {
+            option_id: "approve_once".into(),
+            label: "Approve once".into(),
+            kind: ExecOptionKind::AllowOnce,
+        },
+        ExecRequestOption {
+            option_id: "reject".into(),
+            label: "Reject".into(),
+            kind: ExecOptionKind::RejectOnce,
+        },
+    ]
+}
+
+/// 直达登记一条请求（确定性原则：与 terminal 直达注入同一纪
+/// 律；sink 泵通路单独一条用例覆盖）。
+async fn raise_request(h: &Harness, native: &str) {
+    h.sched
+        .request_reported(
+            native,
+            "sim-req-1".into(),
+            ExecRequestKind::Permission,
+            "Bash: Requesting approval to Running: echo hi".into(),
+            perm_options(),
+        )
+        .await;
+}
+
+/// 当前 Run 的待答请求 id（快照取；断言已登记）。
+fn pending_req_id(h: &Harness, task_id: &ExecTaskId) -> crate::types::ExecRequestId {
+    h.sched
+        .snapshot(task_id)
+        .pending_request
+        .expect("request registered")
+        .request_id
+}
+
+#[tokio::test]
+async fn request_registers_waiting_and_holds_session() {
+    let mut h = harness(SimAdapter::default()).await;
+    let task = make_task(&h, "rq1", &["A", "B"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+
+    // 登记请求 → Pending、Run 转 WaitingRequest、快照带出待回应
+    // 区凭据、事件发出。
+    raise_request(&h, &native).await;
+    let snap = h.sched.snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(RunStatus::WaitingRequest),
+        "等回答的 Run 如实 WaitingRequest"
+    );
+    let pending = snap.pending_request.expect("pending request in snapshot");
+    assert_eq!(pending.run_id, run_a.run_id);
+    assert_eq!(pending.status, ExecRequestStatus::Pending);
+    assert_eq!(pending.options.len(), 2);
+    assert!(
+        drain_events(&mut h.event_rx).contains(&ExecEvent::RequestPending {
+            task_id: task.id.clone(),
+            run_id: run_a.run_id.clone(),
+        }),
+        "RequestPending event emitted"
+    );
+
+    // 等回答仍占有 Session（is_live）：B 不派发（C5/C3）。
+    assert!(!h.sched.try_dispatch(&task.id).await.unwrap());
+    assert_eq!(queue_texts(&h, &task.id), vec!["B"]);
+    assert_eq!(
+        h.adapter.started_runs().len(),
+        1,
+        "no next dispatch while waiting"
+    );
+
+    // 非在飞 Run 的请求不登记（同 terminal 纪律：warn 忽略）。
+    h.sched
+        .request_reported(
+            "unknown-native",
+            "x".into(),
+            ExecRequestKind::Question,
+            "?".into(),
+            vec![],
+        )
+        .await;
+    assert_eq!(
+        h.sched
+            .snapshot(&task.id)
+            .pending_request
+            .unwrap()
+            .native_ref,
+        "sim-req-1",
+        "未知会话的请求不归属任何 Run"
+    );
+}
+
+#[tokio::test]
+async fn answer_validates_run_request_and_duplicates() {
+    let h = harness(SimAdapter::default()).await;
+    let task = make_task(&h, "rq2", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+    raise_request(&h, &native).await;
+    let req_id = pending_req_id(&h, &task.id);
+    let outcome = || RequestOutcome::Selected {
+        option_id: "approve_once".into(),
+    };
+
+    // 错 run → Mismatch（旧轮次不得套新 Run）；零状态变更。
+    assert_eq!(
+        h.sched
+            .answer_request(&task.id, &RunId::new(), &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Mismatch
+    );
+    // 错 req → Mismatch。
+    assert_eq!(
+        h.sched
+            .answer_request(
+                &task.id,
+                &run_a.run_id,
+                &crate::types::ExecRequestId::new(),
+                outcome(),
+            )
+            .await
+            .unwrap(),
+        AnswerOutcome::Mismatch
+    );
+    // 错任务 → Mismatch。
+    assert_eq!(
+        h.sched
+            .answer_request(&ExecTaskId::new(), &run_a.run_id, &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Mismatch
+    );
+    assert!(
+        h.adapter.control().answered_requests().is_empty(),
+        "错配不交付 adapter（不批准任何操作）"
+    );
+    assert_eq!(
+        h.sched.snapshot(&task.id).pending_request.unwrap().status,
+        ExecRequestStatus::Pending,
+        "错配后请求仍待答"
+    );
+
+    // 正确三维 → Resolved（adapter 同步确认）；Submitted→Resolved
+    // 后退出 WaitingRequest（Provider 重新在执行）。
+    assert_eq!(
+        h.sched
+            .answer_request(&task.id, &run_a.run_id, &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Resolved
+    );
+    let answered = h.adapter.control().answered_requests();
+    assert_eq!(answered.len(), 1, "回答交付 adapter 恰好一次");
+    assert_eq!(answered[0].0, native);
+    assert_eq!(answered[0].1, "sim-req-1");
+    assert_eq!(answered[0].2, outcome());
+    let snap = h.sched.snapshot(&task.id);
+    assert!(snap.pending_request.is_none(), "Resolved 后待回应区消失");
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(RunStatus::Running),
+        "无 Pending 剩余 → 退出等待态"
+    );
+
+    // 重复回答 → Already{Resolved}，不重复放行（C5：一次请求只
+    // 一个最终回应）。
+    assert_eq!(
+        h.sched
+            .answer_request(&task.id, &run_a.run_id, &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Already {
+            status: ExecRequestStatus::Resolved,
+        }
+    );
+    assert_eq!(
+        h.adapter.control().answered_requests().len(),
+        1,
+        "重复回答不重复交付 adapter"
+    );
+}
+
+#[tokio::test]
+async fn answer_adapter_error_rolls_back_to_pending() {
+    let h = harness(SimAdapter::default()).await;
+    let task = make_task(&h, "rq3", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+    raise_request(&h, &native).await;
+    let req_id = pending_req_id(&h, &task.id);
+    let outcome = || RequestOutcome::Selected {
+        option_id: "approve_once".into(),
+    };
+
+    // 交付未确认（fail_next_answer）→ 如实 Err，请求回滚
+    // Pending（已提交≠已接收——未确认不冒充 Resolved）。
+    h.adapter.control().fail_next_answer();
+    assert!(
+        h.sched
+            .answer_request(&task.id, &run_a.run_id, &req_id, outcome())
+            .await
+            .is_err(),
+        "adapter 错误如实上抛"
+    );
+    let snap = h.sched.snapshot(&task.id);
+    assert_eq!(
+        snap.pending_request.unwrap().status,
+        ExecRequestStatus::Pending,
+        "回滚待答可重答"
+    );
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(RunStatus::WaitingRequest),
+        "仍等待回答"
+    );
+
+    // 重答成功 → Resolved。
+    assert_eq!(
+        h.sched
+            .answer_request(&task.id, &run_a.run_id, &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Resolved
+    );
+    assert_eq!(h.adapter.control().answered_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn terminal_invalidates_and_late_answer_approves_nothing() {
+    let h = harness(SimAdapter::default()).await;
+    let task = make_task(&h, "rq4", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+    raise_request(&h, &native).await;
+    let req_id = pending_req_id(&h, &task.id);
+    let outcome = || RequestOutcome::Selected {
+        option_id: "approve_once".into(),
+    };
+
+    // run 终态 → 全部 Pending 请求一次性失效（C5；队列空，
+    // current 保留为 run_a 终态记录）。
+    h.sched.terminal(&native, TerminalKind::Completed).await;
+    assert_eq!(
+        h.sched.snapshot(&task.id).pending_request,
+        None,
+        "终态后无待回应区"
+    );
+
+    // 失效后回答 → Invalid，不交付 adapter、不批准任何新操作。
+    assert_eq!(
+        h.sched
+            .answer_request(&task.id, &run_a.run_id, &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Invalid
+    );
+    assert!(
+        h.adapter.control().answered_requests().is_empty(),
+        "失效请求的回答不批准任何操作"
+    );
+
+    // run 被替换（新输入派发出 run_b）后，旧 req + 旧 run →
+    // Mismatch，同样不批准——失效请求永不变成新 Prompt 的放行。
+    h.inbox.accept(&task.id, "rq4-m1", "ou_t", "B", vec![]);
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let run_b = h.sched.snapshot(&task.id).current.unwrap();
+    assert_ne!(run_b.run_id, run_a.run_id);
+    assert_eq!(
+        h.sched
+            .answer_request(&task.id, &run_a.run_id, &req_id, outcome())
+            .await
+            .unwrap(),
+        AnswerOutcome::Mismatch
+    );
+    assert!(h.adapter.control().answered_requests().is_empty());
+}
+
+/// sink 泵通路：raise_request 经 sink 上报 → 泵登记；回答后
+/// auto_resolve_on_answer 经 sink 报终态（与真实 adapter 同通路）。
+#[tokio::test]
+async fn request_and_answer_flow_via_the_sink_pump() {
+    let (sink, rx) = ExecAdapterSink::channel();
+    let adapter = SimAdapter::default().with_sink(sink);
+    let h = harness(adapter).await;
+    let cancel = CancellationToken::new();
+    tokio::spawn(h.sched.clone().terminal_pump(rx, cancel.clone()));
+
+    let task = make_task(&h, "rq5", &["A"]).await;
+    assert!(h.sched.try_dispatch(&task.id).await.unwrap());
+    let native = h.adapter.created_sessions()[0].clone();
+    let run_a = h.sched.snapshot(&task.id).current.unwrap();
+
+    // SimControl.raise_request 经 sink 上报（不直达）→ 泵登记。
+    h.adapter.control().raise_request(
+        &native,
+        ExecRequestKind::Permission,
+        "Bash: echo hi",
+        perm_options(),
+    );
+    wait_until("request registered via the pump", || {
+        h.sched
+            .snapshot(&task.id)
+            .current
+            .as_ref()
+            .is_some_and(|r| r.status == RunStatus::WaitingRequest)
+    })
+    .await;
+    let req_id = pending_req_id(&h, &task.id);
+
+    // 回答即终态旋钮：answer 交付后经 sink 报 Completed（终态不
+    // 在 answer 返回里冒充，C4）。
+    h.adapter.control().set_auto_resolve_on_answer(true);
+    assert_eq!(
+        h.sched
+            .answer_request(
+                &task.id,
+                &run_a.run_id,
+                &req_id,
+                RequestOutcome::Selected {
+                    option_id: "approve_once".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        AnswerOutcome::Resolved
+    );
+    wait_until("run completed via the pump", || {
+        h.sched
+            .snapshot(&task.id)
+            .current
+            .as_ref()
+            .is_some_and(|r| r.status == RunStatus::Completed)
+    })
+    .await;
+    assert_eq!(h.sched.snapshot(&task.id).pending_request, None);
+
+    cancel.cancel();
+}

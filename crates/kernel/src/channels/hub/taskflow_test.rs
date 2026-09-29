@@ -1711,3 +1711,226 @@ async fn restart_redelivery_gets_not_recovered_reply_and_never_reexecutes() {
 
     kernel2.stop().await;
 }
+
+// ── 增量 10：待回应区回答回调（N5/C5）─────────────────────────
+
+/// 授权请求选项（allow_once / reject_once，镜像 ACP 形态）。
+fn perm_options() -> Vec<crate::exec::ExecRequestOption> {
+    vec![
+        crate::exec::ExecRequestOption {
+            option_id: "approve_once".into(),
+            label: "Approve once".into(),
+            kind: crate::exec::ExecOptionKind::AllowOnce,
+        },
+        crate::exec::ExecRequestOption {
+            option_id: "reject".into(),
+            label: "Reject".into(),
+            kind: crate::exec::ExecOptionKind::RejectOnce,
+        },
+    ]
+}
+
+fn answer_value(
+    task: &crate::exec::ExecTask,
+    run: &str,
+    req: &str,
+    gen: i64,
+    opt: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": "exec_answer",
+        "task": task.id.as_str(),
+        "run": run,
+        "req": req,
+        "gen": gen,
+        "opt": opt,
+    })
+}
+
+#[tokio::test]
+async fn exec_answer_button_full_flow_and_revalidation() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    // 事件 relay 显式挂（与增量 4 场景 4 同律：RequestPending 只是
+    // 提示，卡面以锁内快照重渲染）。
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().expect("sim control present");
+    let native = native_id_of(&kernel, &task.id).await;
+    let run_id = kernel
+        .exec_scheduler()
+        .snapshot(&task.id)
+        .current
+        .unwrap()
+        .run_id
+        .as_str()
+        .to_string();
+
+    // Provider 发出授权请求（经 sink 泵登记）→ WaitingRequest +
+    // 卡面待回应区（relay 按 RequestPending 提示刷新）。
+    control.raise_request(
+        &native,
+        crate::exec::ExecRequestKind::Permission,
+        "Bash: Requesting approval to Running: echo hi",
+        perm_options(),
+    );
+    let req_id = wait_until_async("request registered", || {
+        let kernel = Arc::clone(&kernel);
+        let task_id = task.id.clone();
+        async move {
+            kernel
+                .exec_scheduler()
+                .snapshot(&task_id)
+                .pending_request
+                .map(|r| r.request_id.as_str().to_string())
+        }
+    })
+    .await;
+    assert_eq!(
+        kernel
+            .exec_scheduler()
+            .snapshot(&task.id)
+            .current
+            .as_ref()
+            .map(|r| r.status),
+        Some(crate::exec::RunStatus::WaitingRequest),
+        "等回答的 Run 占有 Session（在飞）"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("**待回应**: 授权请求：") && c.contains("exec_answer"))
+        })
+        .await,
+        "card shows pending area with answer buttons"
+    );
+
+    // C9：旧代回调 → 卡片已过期，零状态变更。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, &req_id, 99, "approve_once"),
+        ),
+    )
+    .await;
+    assert!(
+        last_toast(&mock).await.contains("卡片已过期"),
+        "old gen rejected"
+    );
+    assert_eq!(
+        kernel
+            .exec_scheduler()
+            .snapshot(&task.id)
+            .pending_request
+            .unwrap()
+            .status,
+        crate::exec::ExecRequestStatus::Pending,
+        "旧代回调零状态变更"
+    );
+
+    // 错 req → Mismatch，不交付 adapter（不批准任何操作）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, "ereq_wrong", 0, "approve_once"),
+        ),
+    )
+    .await;
+    assert!(
+        last_toast(&mock).await.contains("目标轮次或请求已变化"),
+        "wrong req → Mismatch toast"
+    );
+    assert!(control.answered_requests().is_empty(), "错配不批准任何操作");
+
+    // 正确五维 → 已提交+执行方确认（Sim 同步 ack → Resolved）；
+    // 待回应区消失、Run 回 Running。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, &req_id, 0, "approve_once"),
+        ),
+    )
+    .await;
+    assert!(
+        last_toast(&mock).await.contains("已提交，执行方已确认"),
+        "Resolved toast"
+    );
+    assert_eq!(control.answered_requests().len(), 1, "回答交付恰好一次");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert!(snap.pending_request.is_none(), "Resolved 后待回应区消失");
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Running),
+        "无 Pending 剩余 → 退出等待态"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| !c.contains("**待回应**") && c.contains("执行中 · 第 1 轮"))
+        })
+        .await,
+        "card refreshed without pending area"
+    );
+
+    // 重复点击 → Already，不重复放行（C5：一次请求只一个最终回
+    // 应）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, &req_id, 0, "approve_once"),
+        ),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("不重复放行"), "{toast}");
+    assert_eq!(
+        control.answered_requests().len(),
+        1,
+        "重复回答不重复交付 adapter"
+    );
+
+    kernel.stop().await;
+}
+
+/// 异步谓词轮询（返回值的版本；5s 上限，50ms 步进）。
+async fn wait_until_async<T, F, Fut>(desc: &str, mut pred: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(v) = pred().await {
+            return v;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "等待超时：{desc}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

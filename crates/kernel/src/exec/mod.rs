@@ -21,6 +21,13 @@
 //! （N12/C1）：「查重→凭据→入队」与派发取队段共用 per-task 受理锁，
 //! 跨重启重送项对派发永不可见。
 //!
+//! 增量 10 起承载当前轮问答请求生命周期（`request`，设计依据
+//! N5/C5/D10）：只登记 Provider 明确发出的原生请求；回答按
+//! task/run/request 逐维核对、一次请求只一个最终回应（Submitted
+//! ≠ Resolved，以 adapter 确认为准）；终态/替换/重启后请求失
+//! 效——不批准新操作、不转新 Prompt；等回答的 Run 仍占有
+//! Session（`RunStatus::WaitingRequest` 在飞）。
+//!
 //! 命名刻意避开 `crate::tools::task`（todo 工具域），两者互不相关。
 
 use crate::types::{ExecTaskId, Result};
@@ -34,6 +41,7 @@ pub mod adapter;
 pub mod export;
 pub mod facts;
 pub mod inbox;
+pub mod request;
 pub mod run;
 pub mod scheduler;
 pub mod store;
@@ -43,9 +51,14 @@ pub use adapter::{
 };
 pub use facts::{ExecFactStore, ExecResultRow, ExecRunRow, SqliteExecFactStore};
 pub use inbox::{AcceptOutcome, AcceptedInput, ExecInbox};
+pub use request::{
+    ExecOptionKind, ExecRequest, ExecRequestKind, ExecRequestOption, ExecRequestStatus,
+    RequestOutcome,
+};
 pub use run::{RunRecord, RunStatus};
 pub use scheduler::{
-    AcceptVerdict, ExecEvent, ExecScheduler, LaneSnapshot, ResumeOutcome, StopOutcome,
+    AcceptVerdict, AnswerOutcome, ExecEvent, ExecScheduler, LaneSnapshot, ResumeOutcome,
+    StopOutcome,
 };
 pub use store::SqliteExecTaskStore;
 

@@ -47,11 +47,21 @@
 //!
 //! 事件（`ExecEvent`，tokio broadcast）只是提示（hint）——状态唯
 //! 一事实源是 lane 锁内字段（增量 4 卡面据此刷新，不据事件推断）。
+//!
+//! 增量 10 追加（N5/C5/D10）：当前轮问答请求生命周期——Provider
+//! 明确发出的原生请求登记为 `Pending`、Run 转 `WaitingRequest`
+//! （等回答仍占有 Session）；回答经 `answer_request` 逐维核对
+//! （task/run/request 匹配且请求 Pending）后标 `Submitted`（已提
+//! 交≠已接收），锁外交付 adapter，以其确认为 `Resolved`（一次请
+//! 求只一个最终回应，重复回答不重复放行）；run 终态/被替换后请
+//! 求失效（`Invalidated`）——不批准新操作、不转成新 Prompt。请
+//! 求是进程内语义（D10），重启即全部失效。
 
 use crate::exec::adapter::{AdapterNotice, ExecAdapter, TerminalKind, TerminalNotice};
+use crate::exec::request::{ExecRequest, ExecRequestStatus, RequestOutcome};
 use crate::exec::run::{RunRecord, RunStatus};
 use crate::exec::{AcceptOutcome, BindingState, ExecFactStore, ExecInbox, ExecTask, ExecTaskStore};
-use crate::types::{ExecTaskId, KernelError, Result, RunId};
+use crate::types::{ExecRequestId, ExecTaskId, KernelError, Result, RunId};
 use chrono::Utc;
 use dashmap::DashMap;
 use std::sync::{Arc, Mutex};
@@ -87,6 +97,12 @@ pub enum ExecEvent {
         task_id: ExecTaskId,
         run_id: RunId,
     },
+    /// 当前轮问答请求已登记待回应（增量 10，N5/C5；卡面据此刷新
+    /// 出待回应区——内容仍以锁内快照为准）。
+    RequestPending {
+        task_id: ExecTaskId,
+        run_id: RunId,
+    },
 }
 
 impl ExecEvent {
@@ -99,7 +115,8 @@ impl ExecEvent {
             | Self::Paused { task_id }
             | Self::Resumed { task_id }
             | Self::StopUnconfirmed { task_id, .. }
-            | Self::ResultPublished { task_id, .. } => task_id,
+            | Self::ResultPublished { task_id, .. }
+            | Self::RequestPending { task_id, .. } => task_id,
         }
     }
 }
@@ -130,6 +147,27 @@ pub enum ResumeOutcome {
     BlockedStopUnconfirmed,
 }
 
+/// `answer_request` 的结果（增量 10，N5/C5：一次请求只形成一个
+/// 最终回应；已提交≠已接收）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnswerOutcome {
+    /// 回答已标 Submitted 并交付 adapter（已提交≠已接收——执行
+    /// 方确认未回；保留给异步确认形态的 adapter，本增量的
+    /// Sim/ACP 都是同步确认，直接走 `Resolved`）。
+    Submitted,
+    /// adapter 已确认交付（请求的最终回应，C5）。
+    Resolved,
+    /// 重复回答（已 Submitted/Resolved）：不重复放行、不重复交付
+    /// adapter；`status` 是请求的当前状态。
+    Already { status: ExecRequestStatus },
+    /// 请求已失效（run 终态/被替换）：不批准任何新操作、不转成
+    /// 新 Prompt。
+    Invalid,
+    /// task/run/request 任一不匹配（错 run、错请求、旧轮次）：零
+    /// 状态变更。
+    Mismatch,
+}
+
 /// `accept_input` 的受理判定（增量 9，N12/C1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcceptVerdict {
@@ -154,6 +192,10 @@ pub struct LaneSnapshot {
     /// 运行实例已释放（增量 6，C8/N10）：历史/队列/暂停不动，下
     /// 次输入用原 Session 恢复——卡面「已释放」行的凭据。
     pub released: bool,
+    /// 当前 Run 最早一条未结问答请求（增量 10，N5/C5；Pending 或
+    /// Submitted——Submitted 卡面显示「已提交，待确认」，不显示
+    /// 「已生效」）。None = 无待回应区。
+    pub pending_request: Option<ExecRequest>,
 }
 
 /// 每卡控制 lane（N6 唯一裁定者）。`std::sync::Mutex`：全部判定
@@ -186,12 +228,50 @@ struct TaskLane {
     /// `native_session_id` 保留——恢复是下次派发用原 id（sim 即
     /// 同 id `start_run`）。
     released: bool,
+    /// 当前轮问答请求登记簿（增量 10，N5/C5/D10；进程内语义，重
+    /// 启清空——失效请求保留条目，迟到回答据此如实返回
+    /// `Invalid` 而非 `Mismatch`）。只登记 Provider 明确发出的原
+    /// 生请求。
+    requests: Vec<ExecRequest>,
 }
 
 impl TaskLane {
     /// 记录一次 lane 状态变化（打断在飞的空闲释放计时）。
     fn note_activity(&mut self) {
         self.activity_epoch = self.activity_epoch.wrapping_add(1);
+    }
+
+    /// 失效某 Run 的全部 Pending 请求（增量 10，C5：一次性——终
+    /// 态/run 被替换后请求失效，不批准新操作、不转新 Prompt；
+    /// 条目保留，迟到回答如实 `Invalid`）。返回是否有失效发生。
+    fn invalidate_pending(&mut self, run_id: &RunId) -> bool {
+        let mut any = false;
+        for r in &mut self.requests {
+            if r.run_id == *run_id && r.status == ExecRequestStatus::Pending {
+                r.status = ExecRequestStatus::Invalidated;
+                any = true;
+            }
+        }
+        any
+    }
+
+    /// 等待态重算（增量 10）：当前 Run 已无 Pending 请求时退出
+    /// `WaitingRequest` 回 `Running`（Provider 已重新在执行——
+    /// Submitted 不算结：已提交≠已接收，确认前仍在等待）。
+    fn recompute_waiting(&mut self) {
+        let Some(cur) = self.current.as_mut() else {
+            return;
+        };
+        if cur.status != RunStatus::WaitingRequest {
+            return;
+        }
+        let any_pending = self
+            .requests
+            .iter()
+            .any(|r| r.run_id == cur.run_id && r.status == ExecRequestStatus::Pending);
+        if !any_pending {
+            cur.status = RunStatus::Running;
+        }
     }
 }
 
@@ -260,11 +340,14 @@ impl ExecScheduler {
     }
 
     /// 启动核对（增量 6，N11/D9）：上一进程生命周期未闭合的 Run
-    /// （starting/running/stopping）如实标 `interrupted`——中断是
+    ///（`starting/running/waiting_request/stopping` 四态）如实标
+    /// `interrupted`——中断是
     /// 事实状态，不伪造终态（`terminal_kind`/`ended_at` 留
     /// NULL），不凭旧 running 显示正常，绝不自动重跑。
     /// `Kernel::new` 装配后调用一次；返回标记行数（无 facts 的纯
-    /// 内存台恒 0）。
+    /// 内存台恒 0）。增量 10 注：问答请求是进程内语义（D10），
+    /// 新进程 lanes 为空、无任何请求可失效——boot sweep 天然完
+    /// 成「重启后请求全失效」，无需额外动作。
     pub async fn boot_sweep(&self) -> Result<u64> {
         let Some(facts) = &self.facts else {
             return Ok(0);
@@ -349,6 +432,18 @@ impl ExecScheduler {
                         }
                         Some((native, AdapterNotice::Result(body))) => {
                             self.result_reported(&native, body).await;
+                        }
+                        Some((
+                            native,
+                            AdapterNotice::Request {
+                                native_ref,
+                                kind,
+                                prompt_text,
+                                options,
+                            },
+                        )) => {
+                            self.request_reported(&native, native_ref, kind, prompt_text, options)
+                                .await;
                         }
                         None => break,
                     }
@@ -464,6 +559,172 @@ impl ExecScheduler {
                     error = %e,
                     "exec result save failed; not published"
                 );
+            }
+        }
+    }
+
+    /// 问答请求登记（增量 10，N5/C5）：按 native id 反查 lane/run
+    ///（同 terminal 纪律——反查不到 → warn 忽略，绝不归属最新
+    /// 轮）。只登记当前 Run 正在等待的原生请求：Run 须为
+    /// `Running`/`WaitingRequest`（`Starting` 尚无原生轮次可问；
+    /// `Stopping` 与 cancel 竞态——轮次即将收口，登记无意义，如
+    /// 实 warn 忽略）。登记后 `Running → WaitingRequest`：等回答
+    /// 的 Run 仍占有本 Session（`is_live`），不能开始下一轮。
+    pub async fn request_reported(
+        &self,
+        native_session_id: &str,
+        native_ref: String,
+        kind: crate::exec::request::ExecRequestKind,
+        prompt_text: String,
+        options: Vec<crate::exec::request::ExecRequestOption>,
+    ) {
+        let Some((task_id, lane)) = self.find_lane_by_native(native_session_id) else {
+            tracing::warn!(
+                native_session_id,
+                "exec request for unknown native session; ignored (never attached to the latest run)"
+            );
+            return;
+        };
+        let mut g = lane.lock().unwrap();
+        let Some(cur) = g.current.as_ref() else {
+            tracing::warn!(
+                native_session_id,
+                "exec request without a current run; ignored"
+            );
+            return;
+        };
+        if !matches!(cur.status, RunStatus::Running | RunStatus::WaitingRequest) {
+            tracing::warn!(
+                native_session_id,
+                status = ?cur.status,
+                "exec request for a run not awaiting answers; ignored"
+            );
+            return;
+        }
+        let request = ExecRequest {
+            request_id: ExecRequestId::new(),
+            task_id: task_id.clone(),
+            run_id: cur.run_id.clone(),
+            native_ref,
+            kind,
+            prompt_text,
+            options,
+            status: ExecRequestStatus::Pending,
+            created_at: Utc::now(),
+        };
+        let run_id = request.run_id.clone();
+        g.requests.push(request);
+        let cur = g.current.as_mut().unwrap();
+        if cur.status == RunStatus::Running {
+            cur.status = RunStatus::WaitingRequest;
+        }
+        // 请求登记 = lane 状态变化（打断空闲释放计时——等回答的
+        // Run 仍占有 Session，C5/C8）。
+        g.note_activity();
+        let _ = self
+            .event_tx
+            .send(ExecEvent::RequestPending { task_id, run_id });
+    }
+
+    /// 回答一条问答请求（增量 10，N5/C5）。逐维核对——任务/run
+    /// 匹配、请求属于该 run 且仍 `Pending`（操作者权限由调用方
+    /// 闸）；核对过标 `Submitted`（**已提交≠已接收**），锁外经
+    /// adapter 交付；Ok 标 `Resolved`（以 adapter 确认为准——一
+    /// 次请求只此一个最终回应），Err 回滚 `Pending` 并如实报错。
+    /// 重复回答（已 Submitted/Resolved）→ `Already`，不重复放
+    /// 行、不重复交付 adapter；已失效 → `Invalid`，不批准任何新
+    /// 操作、不转成新 Prompt。
+    pub async fn answer_request(
+        &self,
+        task_id: &ExecTaskId,
+        run_id: &RunId,
+        request_id: &ExecRequestId,
+        outcome: RequestOutcome,
+    ) -> Result<AnswerOutcome> {
+        let lane = self.lane(task_id);
+        // ── 锁内：逐维核对 + Submitted 占位（占位即关死并发重复
+        // 回答——第二调用见 Submitted 即 Already，不重复放行）──
+        let (native_id, native_ref) = {
+            let mut g = lane.lock().unwrap();
+            let Some(cur) = g.current.as_ref() else {
+                return Ok(AnswerOutcome::Mismatch);
+            };
+            if cur.run_id != *run_id {
+                // 旧按钮/旧轮次不得套到新 Run（同 C6/R7 纪律）。
+                return Ok(AnswerOutcome::Mismatch);
+            }
+            let native_id = g.native_session_id.clone().unwrap_or_default();
+            let Some(idx) = g
+                .requests
+                .iter()
+                .position(|r| r.request_id == *request_id && r.run_id == *run_id)
+            else {
+                return Ok(AnswerOutcome::Mismatch);
+            };
+            match g.requests[idx].status {
+                ExecRequestStatus::Pending => {
+                    g.requests[idx].status = ExecRequestStatus::Submitted;
+                    let native_ref = g.requests[idx].native_ref.clone();
+                    g.note_activity();
+                    (native_id, native_ref)
+                }
+                ExecRequestStatus::Submitted | ExecRequestStatus::Resolved => {
+                    return Ok(AnswerOutcome::Already {
+                        status: g.requests[idx].status,
+                    });
+                }
+                ExecRequestStatus::Invalidated => return Ok(AnswerOutcome::Invalid),
+            }
+        };
+
+        // ── 锁外：交付 adapter（C5：以 adapter 确认为 Resolved
+        // 凭据；能力不支持的回答形态由 adapter 如实报错，不伪装）──
+        match self.adapter.answer(&native_id, &native_ref, outcome).await {
+            Ok(()) => {
+                let mut g = lane.lock().unwrap();
+                if let Some(req) = g
+                    .requests
+                    .iter_mut()
+                    .find(|r| r.request_id == *request_id && r.run_id == *run_id)
+                {
+                    // 只认领自己提交的份额：状态仍 Submitted 才标
+                    // Resolved（锁外期间run 终态不改写 Submitted
+                    // 条目，见 invalidate_pending 的 Pending 限定）。
+                    if req.status == ExecRequestStatus::Submitted {
+                        req.status = ExecRequestStatus::Resolved;
+                    }
+                }
+                // 无 Pending 剩余 → 退出 WaitingRequest（Provider 已
+                // 重新在执行）。
+                g.recompute_waiting();
+                g.note_activity();
+                Ok(AnswerOutcome::Resolved)
+            }
+            Err(e) => {
+                let mut g = lane.lock().unwrap();
+                // 回滚目标态先在请求借用外算清（run 是否仍在飞）。
+                let run_live = g
+                    .current
+                    .as_ref()
+                    .is_some_and(|c| c.run_id == *run_id && c.status.is_live());
+                if let Some(req) = g
+                    .requests
+                    .iter_mut()
+                    .find(|r| r.request_id == *request_id && r.run_id == *run_id)
+                {
+                    if req.status == ExecRequestStatus::Submitted {
+                        // 回滚待答：run 仍在飞 → 回 Pending 可重答；
+                        // run 已终态（锁外期间收口）→ 直接失效
+                        //（C5：终态后请求不批准新操作）。
+                        req.status = if run_live {
+                            ExecRequestStatus::Pending
+                        } else {
+                            ExecRequestStatus::Invalidated
+                        };
+                    }
+                }
+                g.note_activity();
+                Err(e)
             }
         }
     }
@@ -784,7 +1045,10 @@ impl ExecScheduler {
             };
             if !matches!(
                 cur.status,
-                RunStatus::Starting | RunStatus::Running | RunStatus::Stopping
+                RunStatus::Starting
+                    | RunStatus::Running
+                    | RunStatus::WaitingRequest
+                    | RunStatus::Stopping
             ) {
                 tracing::warn!(
                     native_session_id,
@@ -806,6 +1070,10 @@ impl ExecScheduler {
             cur.ended_at = Some(Utc::now());
             let run_id = cur.run_id.clone();
             let fact = cur.clone();
+            // 增量 10（C5）：run 终态（含 Stopped/Failed）→ 该 run
+            // 全部 Pending 请求一次性失效——后续回答返回 `Invalid`，
+            // 不批准任何新操作、不转成新 Prompt。
+            g.invalidate_pending(&run_id);
             g.permit = None; // 释放名额
             g.stop_requested_at = None;
             // 终态提交 = lane 状态变化（打断在飞的空闲释放计时）。
@@ -1048,12 +1316,27 @@ impl ExecScheduler {
     pub fn snapshot(&self, task_id: &ExecTaskId) -> LaneSnapshot {
         let lane = self.lane(task_id);
         let g = lane.lock().unwrap();
+        // 增量 10：当前 Run 最早一条未结请求（Pending/Submitted）
+        // 进快照——卡面待回应区的凭据；Resolved/Invalidated 不出区。
+        let pending_request = g.current.as_ref().and_then(|cur| {
+            g.requests
+                .iter()
+                .find(|r| {
+                    r.run_id == cur.run_id
+                        && matches!(
+                            r.status,
+                            ExecRequestStatus::Pending | ExecRequestStatus::Submitted
+                        )
+                })
+                .cloned()
+        });
         LaneSnapshot {
             paused: g.paused,
             current: g.current.clone(),
             queued: self.inbox.len(task_id),
             blocked_unknown: g.blocked_unknown,
             released: g.released,
+            pending_request,
         }
     }
 
@@ -1067,6 +1350,9 @@ impl ExecScheduler {
         {
             g.current = None;
             g.permit = None;
+            // 增量 10（C5）：run 被移除 → 其 Pending 请求一并失效
+            //（Starting 本不会有请求，防御性一次性失效）。
+            g.invalidate_pending(run_id);
         }
     }
 
@@ -1089,6 +1375,8 @@ impl ExecScheduler {
         }
         g.permit = None;
         g.blocked_unknown = true;
+        // 增量 10（C5）：run 被移除 → 其 Pending 请求一并失效。
+        g.invalidate_pending(run_id);
     }
 }
 

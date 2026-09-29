@@ -10,11 +10,13 @@
 use super::*;
 use crate::exec::adapter::ExecAdapterSink;
 use crate::exec::{
-    AcceptOutcome, BindingState, CreateExecTask, ExecEvent, ExecFactStore, ExecProvider,
-    ExecScheduler, ExecTask, ExecTaskSource, ExecTaskStore, ResumeOutcome, RunStatus,
-    SqliteExecFactStore, SqliteExecTaskStore, StopOutcome,
+    AcceptOutcome, AnswerOutcome, BindingState, CreateExecTask, ExecEvent, ExecFactStore,
+    ExecOptionKind, ExecProvider, ExecRequestKind, ExecRequestStatus, ExecScheduler, ExecTask,
+    ExecTaskSource, ExecTaskStore, RequestOutcome, ResumeOutcome, RunStatus, SqliteExecFactStore,
+    SqliteExecTaskStore, StopOutcome,
 };
 use crate::storage::migrations::run_migrations;
+use crate::types::{ExecRequestId, RunId};
 use sqlx::sqlite::SqlitePoolOptions;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -606,4 +608,184 @@ async fn scenario_4_two_cards_isolation() {
     rig.teardown().await;
     assert!(result.is_ok(), "场景 4 超时（{SCENARIO_TIMEOUT:?}）");
     eprintln!("[s4] scenario done in {:?}", started.elapsed());
+}
+
+// ── 场景 5：真实授权请求的回答生命周期（N5/C5）──────────────────
+//
+// permission_mode 置 manual-approval 的择路记录（spec 组件 4）：
+// 实测 kimi 2.1.0 ACP 有 `session/set_mode`，但 modeId 集合是
+// default/plan/auto/yolo——**无 "ask"**；`default` 即 Manual
+// approvals（session/new 的 configOptions 自述）。故采
+// `session/set_mode {modeId:"default"}`（`enable_permission_ask`
+// 在 session/new 后调用），不改全局 config、不开独立
+// KIMI_CONFIG_HOME。
+
+#[tokio::test]
+#[ignore = "acp e2e：需 YOMI_ACP_E2E=1 与 kimi 二进制"]
+async fn scenario_5_permission_request_answer_lifecycle() {
+    if !e2e_enabled() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut rig = Rig::new().await;
+    let result = tokio::time::timeout(SCENARIO_TIMEOUT, async {
+        // 建 session 前开 ask：此后该进程 request_permission 转发
+        // 调度器等人工回答（不自动应答）。
+        rig.adapter.enable_permission_ask();
+        let task = make_task(&rig, "s5").await;
+        accept(
+            &rig,
+            &task.id,
+            "s5-m0",
+            "Run this exact shell command: echo PERM_S5_OK. \
+             You MUST actually execute it with your shell tool before replying. \
+             Then reply with exactly the single token: S5_DONE. Nothing else.",
+        )
+        .await;
+
+        // ① prompt 触发 shell 工具 → 收到 Request notice、run 转
+        // WaitingRequest、快照（卡面凭据）有待回应区。
+        assert!(rig.sched.try_dispatch(&task.id).await.unwrap());
+        let native = bound_native(&rig, &task.id).await;
+        wait_until_sync(
+            "run waiting for answer",
+            current_status_is(&rig, &task.id, RunStatus::WaitingRequest),
+        )
+        .await;
+        let snap = rig.sched.snapshot(&task.id);
+        let run = snap.current.expect("run current");
+        let req = snap
+            .pending_request
+            .expect("pending request in snapshot (卡面待回应区凭据)");
+        assert_eq!(req.kind, ExecRequestKind::Permission);
+        assert_eq!(req.status, ExecRequestStatus::Pending);
+        assert!(
+            req.options
+                .iter()
+                .any(|o| o.kind == ExecOptionKind::AllowOnce),
+            "native allow option mapped: {:?}",
+            req.options
+        );
+        assert!(
+            req.options
+                .iter()
+                .any(|o| o.kind == ExecOptionKind::RejectOnce),
+            "native reject option kept unbeautified: {:?}",
+            req.options
+        );
+        let events = drain_events(&mut rig.event_rx);
+        assert!(
+            events.contains(&ExecEvent::RequestPending {
+                task_id: task.id.clone(),
+                run_id: run.run_id.clone(),
+            }),
+            "RequestPending missing: {events:?}"
+        );
+        eprintln!(
+            "[s5] request pending on {native}: {} opts={:?}",
+            req.prompt_text,
+            req.options
+                .iter()
+                .map(|o| (&o.option_id, o.kind))
+                .collect::<Vec<_>>()
+        );
+
+        // ② 错误 req / 错误 run 回答 → Mismatch，零状态变更。
+        let outcome = || RequestOutcome::Selected {
+            option_id: "approve_once".into(),
+        };
+        assert_eq!(
+            rig.sched
+                .answer_request(&task.id, &run.run_id, &ExecRequestId::new(), outcome())
+                .await
+                .unwrap(),
+            AnswerOutcome::Mismatch,
+            "wrong req → Mismatch"
+        );
+        assert_eq!(
+            rig.sched
+                .answer_request(&task.id, &RunId::new(), &req.request_id, outcome())
+                .await
+                .unwrap(),
+            AnswerOutcome::Mismatch,
+            "wrong run → Mismatch"
+        );
+        assert_eq!(
+            rig.sched.snapshot(&task.id).pending_request.unwrap().status,
+            ExecRequestStatus::Pending,
+            "错配后请求仍待答"
+        );
+
+        // ③ 正确回答 allow_once → adapter 确认 Resolved → 退出等
+        // 待态 → prompt 继续 → Terminal(Completed)、正文保存。
+        let allow = req
+            .options
+            .iter()
+            .find(|o| o.kind == ExecOptionKind::AllowOnce)
+            .unwrap();
+        assert_eq!(
+            rig.sched
+                .answer_request(
+                    &task.id,
+                    &run.run_id,
+                    &req.request_id,
+                    RequestOutcome::Selected {
+                        option_id: allow.option_id.clone(),
+                    },
+                )
+                .await
+                .unwrap(),
+            AnswerOutcome::Resolved,
+            "adapter ack decides Resolved"
+        );
+        assert!(
+            rig.sched.snapshot(&task.id).pending_request.is_none(),
+            "Resolved 后待回应区消失"
+        );
+        assert_eq!(
+            rig.sched.snapshot(&task.id).current.unwrap().status,
+            RunStatus::Running,
+            "无 Pending 剩余 → Provider 重新在执行"
+        );
+        wait_until_sync(
+            "run completed after answer",
+            current_status_is(&rig, &task.id, RunStatus::Completed),
+        )
+        .await;
+        let runs = rig.facts.runs_for(&task.id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].terminal_kind.as_deref(), Some("completed"));
+        let row = rig
+            .facts
+            .result_for(&runs[0].run_id)
+            .await
+            .unwrap()
+            .expect("authoritative body saved");
+        assert!(
+            row.body.contains("S5_DONE") || row.body.contains("PERM_S5_OK"),
+            "prompt continued after approval; body: {}",
+            row.body
+        );
+        eprintln!(
+            "[s5] approved → prompt completed, body saved: {:?}",
+            row.body
+        );
+
+        // ④ 二次回答同 req → Already{Resolved}，不重复放行（C5：
+        // 一次请求只一个最终回应）。
+        assert_eq!(
+            rig.sched
+                .answer_request(&task.id, &run.run_id, &req.request_id, outcome())
+                .await
+                .unwrap(),
+            AnswerOutcome::Already {
+                status: ExecRequestStatus::Resolved,
+            },
+            "duplicate answer not re-delivered"
+        );
+    })
+    .await;
+    rig.teardown().await;
+    assert!(result.is_ok(), "场景 5 超时（{SCENARIO_TIMEOUT:?}）");
+    eprintln!("[s5] scenario done in {:?}", started.elapsed());
 }

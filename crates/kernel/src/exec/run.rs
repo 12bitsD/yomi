@@ -13,8 +13,10 @@ use serde::{Deserialize, Serialize};
 /// Run 状态机。
 ///
 /// `Starting`：已取资格、adapter start 未确认；`Running`：adapter
-/// 已确认开始；`Stopping`：停止已受理、原生终态未确认（停止中≠已
-/// 停止，C6）；`Completed`/`Failed`：已确认自然终态（业务失败不自
+/// 已确认开始；`WaitingRequest`：执行中且 Provider 有未结问答请
+/// 求（增量 10，N5/C5——等回答仍占有本 Session，不能开始下一
+/// 轮）；`Stopping`：停止已受理、原生终态未确认（停止中≠已停
+/// 止，C6）；`Completed`/`Failed`：已确认自然终态（业务失败不自
 /// 动暂停，N3）；`Stopped`：取消已确认；`Unknown`：派发或终态确认
 /// 丢失——阻止下一轮（N3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +24,7 @@ use serde::{Deserialize, Serialize};
 pub enum RunStatus {
     Starting,
     Running,
+    WaitingRequest,
     Stopping,
     Completed,
     Failed,
@@ -31,9 +34,13 @@ pub enum RunStatus {
 
 impl RunStatus {
     /// 在飞（占用当前 Run 槽位，阻止新派发）：Starting/Running/
-    /// Stopping。Unknown 虽非在飞，经 `blocked_unknown` 单独阻断。
+    /// WaitingRequest/Stopping。Unknown 虽非在飞，经
+    /// `blocked_unknown` 单独阻断。
     pub fn is_live(&self) -> bool {
-        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+        matches!(
+            self,
+            Self::Starting | Self::Running | Self::WaitingRequest | Self::Stopping
+        )
     }
 }
 

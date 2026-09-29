@@ -261,6 +261,7 @@ fn status_str(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Starting => "starting",
         RunStatus::Running => "running",
+        RunStatus::WaitingRequest => "waiting_request",
         RunStatus::Stopping => "stopping",
         RunStatus::Completed => "completed",
         RunStatus::Failed => "failed",
@@ -484,7 +485,7 @@ impl ExecFactStore for SqliteExecFactStore {
         // 态，不伪造终态种类或结束时刻。
         let marked = sqlx::query(
             r"UPDATE exec_runs SET status = 'interrupted'
-               WHERE status IN ('starting', 'running', 'stopping')",
+               WHERE status IN ('starting', 'running', 'waiting_request', 'stopping')",
         )
         .execute(&self.pool)
         .await

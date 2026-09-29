@@ -25,10 +25,11 @@ use tracing::warn;
 
 use crate::channels::{cards::taskcard::task_card, CardAction, ChannelConfig, PlatformAdapter};
 use crate::exec::{
-    CreateExecTask, ExecTask, ExecTaskStatus, ResumeOutcome, RunStatus, StopOutcome,
+    AnswerOutcome, CreateExecTask, ExecRequestStatus, ExecTask, ExecTaskStatus, RequestOutcome,
+    ResumeOutcome, RunStatus, StopOutcome,
 };
 use crate::kernel::Kernel;
-use crate::types::{ExecTaskId, Result, RunId};
+use crate::types::{ExecRequestId, ExecTaskId, Result, RunId};
 
 /// 「登记 + 发卡」的结果（三态如实，入口各自呈现）。
 pub(crate) enum AnnounceOutcome {
@@ -120,11 +121,14 @@ pub(crate) async fn handle_exec_action(
     let task_str = action.value["task"].as_str().unwrap_or_default();
     let gen = action.value["gen"].as_i64();
     let run_str = action.value["run"].as_str();
-    if !matches!(op, "exec_stop" | "exec_resume")
+    let req_str = action.value["req"].as_str().unwrap_or_default();
+    let opt_str = action.value["opt"].as_str().unwrap_or_default();
+    if !matches!(op, "exec_stop" | "exec_resume" | "exec_answer")
         || task_str.is_empty()
         || gen.is_none()
         || action.value.get("run").is_none()
-        || (op == "exec_stop" && run_str.unwrap_or_default().is_empty())
+        || (matches!(op, "exec_stop" | "exec_answer") && run_str.unwrap_or_default().is_empty())
+        || (op == "exec_answer" && (req_str.is_empty() || opt_str.is_empty()))
     {
         warn!(
             channel = channel_name,
@@ -214,6 +218,59 @@ pub(crate) async fn handle_exec_action(
                 toast("停止尚未确认，保持暂停；确认后请再次恢复").await;
             }
         },
+        // 增量 10（N5/C5）：待回应区选项回答。重核与 exec_stop 同
+        // 全维度（字段/开关/任务/代次/归档在上方已过；run/req/
+        // Pending 核对在 `answer_request` 锁内）；toast 如实映射—
+        // —「已提交」≠「已生效」，重复不重复放行，失效不批准任何
+        // 操作。
+        "exec_answer" => {
+            let expected = RunId::from(run_str.unwrap_or_default());
+            let request_id = ExecRequestId::from(req_str);
+            let outcome = RequestOutcome::Selected {
+                option_id: opt_str.to_string(),
+            };
+            match kernel
+                .exec_scheduler()
+                .answer_request(&task_id, &expected, &request_id, outcome)
+                .await
+            {
+                Ok(AnswerOutcome::Resolved) => {
+                    toast("已提交，执行方已确认").await;
+                    refresh_card(kernel, &task_id).await;
+                }
+                Ok(AnswerOutcome::Submitted) => {
+                    toast("已提交，等待执行方确认").await;
+                    refresh_card(kernel, &task_id).await;
+                }
+                Ok(AnswerOutcome::Already { status }) => {
+                    toast(&format!(
+                        "该请求{}，不重复放行",
+                        match status {
+                            ExecRequestStatus::Submitted => "已提交，等待执行方确认",
+                            ExecRequestStatus::Resolved => "已回答并经执行方确认",
+                            other => other.label(),
+                        },
+                    ))
+                    .await;
+                }
+                // C5：失效请求不批准任何新操作、不转成新 Prompt。
+                Ok(AnswerOutcome::Invalid) => {
+                    toast("该请求已失效（轮次已结束/被替换），未执行任何操作").await;
+                    refresh_card(kernel, &task_id).await;
+                }
+                Ok(AnswerOutcome::Mismatch) => {
+                    toast("目标轮次或请求已变化，操作未生效").await;
+                    refresh_card(kernel, &task_id).await;
+                }
+                // 交付未确认：调度器已回滚待答状态，可重答。
+                Err(e) => {
+                    warn!(channel = channel_name, task_id = %task_id, error = %e,
+                        "exec answer delivery failed; request rolled back to pending");
+                    toast("⚠️ 回答提交失败（未确认），请重试").await;
+                    refresh_card(kernel, &task_id).await;
+                }
+            }
+        }
         _ => unreachable!("op 已在 ① 白名单校验"),
     }
 }
@@ -263,6 +320,7 @@ fn run_status_label(status: RunStatus) -> &'static str {
     match status {
         RunStatus::Starting => "启动中",
         RunStatus::Running => "执行中",
+        RunStatus::WaitingRequest => "等待回应",
         RunStatus::Stopping => "停止中",
         RunStatus::Stopped => "已停止",
         RunStatus::Completed => "已完成",
