@@ -8,7 +8,7 @@ use sqlx::sqlite::SqlitePool;
 use tracing::{info, warn};
 
 /// Current schema version - bump this when adding new migrations
-pub const CURRENT_SCHEMA_VERSION: i64 = 25;
+pub const CURRENT_SCHEMA_VERSION: i64 = 29;
 
 /// A single database migration (can contain multiple SQL statements)
 struct Migration {
@@ -318,6 +318,104 @@ const MIGRATIONS: &[Migration] = &[
         // 旋钮一列。更新走 json_set/json_remove 原子按键写。
         name: "add_session_settings",
         sqls: &[r"ALTER TABLE sessions ADD COLUMN settings TEXT;"],
+    },
+    Migration {
+        version: 26,
+        // chat-flow W1 执行任务登记（exec registry，设计依据
+        // docs/design/chat-flow-technical-design.md N1/N2/C2）：任务
+        // 身份 + Provider 绑定三态机持久化。dedup 唯一索引保证同一
+        // 创建意图重送收敛到同一任务（create 走 ON CONFLICT DO
+        // NOTHING，不改既有行）。
+        name: "add_exec_tasks",
+        sqls: &[
+            r"CREATE TABLE exec_tasks (
+                id TEXT PRIMARY KEY,
+                channel_name TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                binding TEXT NOT NULL DEFAULT 'uninitialized',
+                provider_session_id TEXT,
+                thread_root_msg_id TEXT,
+                card_msg_id TEXT,
+                card_generation INTEGER NOT NULL DEFAULT 0,
+                goal TEXT NOT NULL,
+                working_dir TEXT,
+                created_by TEXT NOT NULL,
+                source TEXT NOT NULL,
+                dedup_key TEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+            r"CREATE UNIQUE INDEX idx_exec_tasks_dedup ON exec_tasks(channel_name, dedup_key);",
+            r"CREATE INDEX idx_exec_tasks_thread ON exec_tasks(thread_root_msg_id);",
+        ],
+    },
+    Migration {
+        version: 27,
+        // chat-flow W2 增量 5：Run 关键事实（N7）+ 按 Run 保存的权
+        // 威结果正文（N9，先保存再公布）。`terminal_kind` 终态一次性
+        // 写入之后拒改（单向）；`exec_results` 一 Run 一份正文，重复
+        // 上报 INSERT OR IGNORE 不覆盖。
+        name: "add_exec_run_facts",
+        sqls: &[
+            r"CREATE TABLE exec_runs (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES exec_tasks(id),
+                input_seq INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                text TEXT NOT NULL,
+                image_keys TEXT NOT NULL DEFAULT '[]',
+                terminal_kind TEXT,
+                started_at DATETIME NOT NULL,
+                ended_at DATETIME,
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+            r"CREATE INDEX idx_exec_runs_task ON exec_runs(task_id, input_seq);",
+            r"CREATE TABLE exec_results (
+                run_id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL REFERENCES exec_tasks(id),
+                input_seq INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                body_bytes INTEGER NOT NULL,
+                meta TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+            r"CREATE INDEX idx_exec_results_task ON exec_results(task_id, input_seq);",
+        ],
+    },
+    Migration {
+        version: 28,
+        // chat-flow W2 增量 6：受理凭据持久化（C1/N12，设计依据
+        // docs/design/chat-flow-technical-design.md N12「记录收到什
+        // 么、是否开始」）。重启后旧输入重送可区分「上一进程生命周
+        // 期受理过」并明确拒绝重排队/重执行；`started` 记录该输入
+        // 是否已被派发（N12「是否开始」）。这是最小去重账本，不是
+        // 待执行队列持久化——绝不用于重放旧输入（D2/D9）。
+        name: "add_exec_acceptance",
+        sqls: &[r"CREATE TABLE exec_acceptance (
+                channel_name TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                task_id TEXT NOT NULL REFERENCES exec_tasks(id),
+                accepted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (channel_name, msg_id)
+            );"],
+    },
+    Migration {
+        version: 29,
+        // chat-flow 增量 8（§8-L1 换代期限事实列，设计依据
+        // docs/design/chat-flow-technical-design.md §8「保存消息发
+        // 送时间、实体创建时间及当前代次」）：`card_sent_at` 发卡
+        // 时刻（create_and_announce 经 set_thread_and_card 回填、
+        // 换代经 bump_card_generation 回填；v29 前存量行 NULL，换
+        // 代决策回退 created_at——卡即创建时所发）。`card_entity_
+        // created_at` 预留给 CardKit 实体启用后回填（实体 14 天期
+        // 限的判据；未启用恒 NULL，决策只用消息期限）。
+        name: "add_exec_card_renewal_facts",
+        sqls: &[
+            r"ALTER TABLE exec_tasks ADD COLUMN card_sent_at DATETIME;",
+            r"ALTER TABLE exec_tasks ADD COLUMN card_entity_created_at DATETIME;",
+        ],
     },
 ];
 

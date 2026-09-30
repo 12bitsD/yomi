@@ -25,6 +25,7 @@ pub mod compactor;
 pub mod config;
 pub mod cron;
 pub mod event;
+pub mod exec;
 pub mod hook;
 pub mod kernel;
 pub mod kv_cache;
@@ -193,9 +194,18 @@ pub async fn build_kernel(config: &Config, enable_cron: bool) -> Result<Arc<Kern
         config.models.clone(),
         config.tasks.clone(),
         config.gc.clone(),
+        config.exec.clone(),
         config.features.update_session_title_enabled(),
         config.auto_approve,
     )?;
+
+    // chat-flow 增量 6（N11/D9）：启动核对——`Kernel::new` 装配后
+    // 调用一次。上一进程生命周期未闭合的 Run 如实标 interrupted
+    // （不凭旧 running 显示正常，不自动重跑）。失败只 warn：不阻
+    // 碍启动，查询面如实反映缺失（增量 5 事实纪律）。
+    if let Err(e) = kernel.exec_scheduler().boot_sweep().await {
+        tracing::warn!(error = %e, "exec boot sweep failed; open runs not marked interrupted");
+    }
 
     Ok(kernel)
 }

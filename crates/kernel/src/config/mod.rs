@@ -236,6 +236,45 @@ impl Default for GcConfig {
     }
 }
 
+/// 执行任务运行控制（`[exec]` 顶层段，chat-flow 增量 3）。
+///
+/// 设计依据 docs/design/chat-flow-technical-design.md N3/C3：并发名额
+/// 是部署参数，统一分配、轮次间公平、不抢占当前 Run；停止确认超时
+/// 是 N6/C6「停止中≠已停止」的升级阈值。增量 6 追加空闲释放阈值
+/// （C8/N10）。
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct ExecConfig {
+    /// 全局并发 Run 名额（按卡隔离、统一分配；min 1）
+    pub max_concurrent_runs: usize,
+    /// 停止确认超时（秒）：cancel 受理后超时不报原生终态 → 标记
+    /// `StopUnconfirmed` 并保留 Stopping（未确认，继续禁写）
+    pub stop_confirm_timeout_secs: u64,
+    /// 空闲释放阈值（秒，C8/N10）：终态事实写定且无立即可派项后，
+    /// 运行实例空闲超过本阈值即释放——不删历史、不动队列/暂停状
+    /// 态（暂停且有等待项同样释放）；下次输入用原 Session 恢复。
+    pub idle_release_secs: u64,
+    /// 主卡换代余量（秒，增量 8，§8-L1）：活跃/待回答任务在最早
+    /// 适用更新期限（消息 14 天 / `CardKit` 实体 14 天，取较早者）
+    /// 前留出本余量即换代——重试与 sweep 周期的缓冲。
+    pub card_renew_margin_secs: u64,
+    /// 主卡换代 sweep 周期（秒，增量 8）：hub relay 同进程的低频
+    /// 清扫，对活动任务跑换代决策并执行临期换代。
+    pub card_renew_sweep_secs: u64,
+}
+
+impl Default for ExecConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_runs: 2,
+            stop_confirm_timeout_secs: 30,
+            idle_release_secs: 60,
+            card_renew_margin_secs: 129_600,
+            card_renew_sweep_secs: 1800,
+        }
+    }
+}
+
 /// Editable kernel configuration and its effective startup representation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KernelConfig {
@@ -273,6 +312,8 @@ pub struct Config {
     pub max_checkpoints: usize,
     /// Garbage-collection policy for expired session resources
     pub gc: GcConfig,
+    /// 执行任务运行控制（chat-flow 增量 3）
+    pub exec: ExecConfig,
     /// Socket auth password hash (`blake3:<hex>`), enforced on ws/wss
     /// transports only; unix sockets rely on filesystem permissions.
     /// `YOMI_SOCKET_AUTH_HASH` overrides. None = no auth.
@@ -300,6 +341,7 @@ impl Default for Config {
             features: FeaturesConfig::default(),
             max_checkpoints: 5,
             gc: GcConfig::default(),
+            exec: ExecConfig::default(),
             socket_auth_hash: None,
             channels: Vec::new(),
             models: vec![ModelConfig::default()],
@@ -518,6 +560,13 @@ impl Config {
             return Err(KernelError::config(format!(
                 "gc.retention_days must be at least 1, got {}",
                 self.gc.retention_days
+            )));
+        }
+
+        if self.exec.max_concurrent_runs < 1 {
+            return Err(KernelError::config(format!(
+                "exec.max_concurrent_runs must be at least 1, got {}",
+                self.exec.max_concurrent_runs
             )));
         }
 

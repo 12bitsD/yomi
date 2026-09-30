@@ -1,0 +1,1936 @@
+//! chat-flow 增量 2 集成测试：N1 双入口创建契约（slash `/task` +
+//! 内建工具 `task_create`）、任务 Thread 确定性分流与进程内受理登
+//! 记。设计依据 docs/design/chat-flow-technical-design.md N1/C1/C2/D2。
+//!
+//! 复用 hub_test 的 `MockAdapter`（同模块树兄弟节点），hub 实例经
+//! `ChannelInstance::test_instance` 注入——工具侧
+//! `get_routing_for_session` 因此能解析出路由与 adapter。
+
+use super::tests::MockAdapter;
+use super::*;
+
+use crate::channels::hub_handlers::handle_incoming_message;
+use crate::channels::{ChannelConfig, ChannelMessage, ChannelStore, MappingKind, PlatformConfig};
+use crate::exec::SqliteExecTaskStore;
+use crate::storage::migrations::run_migrations;
+use crate::tools::{TaskCreateTool, Tool, ToolExecCtx, TASK_CREATE_TOOL_NAME};
+
+/// 测试台：kernel（带 "mock" 通道配置 → channel_hub 存在）+ 注入
+/// mock adapter 的通道实例 + hub 自带的 channel store。
+async fn task_harness() -> (
+    Arc<Kernel>,
+    Arc<MockAdapter>,
+    Arc<dyn ChannelStore>,
+    ChannelConfig,
+    tempfile::TempDir,
+) {
+    task_harness_with_exec_tasks(true).await
+}
+
+/// 带开关的测试台（增量 3 场景 9：`exec_tasks=false` 回归用）。
+async fn task_harness_with_exec_tasks(
+    exec_tasks: bool,
+) -> (
+    Arc<Kernel>,
+    Arc<MockAdapter>,
+    Arc<dyn ChannelStore>,
+    ChannelConfig,
+    tempfile::TempDir,
+) {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = ChannelConfig {
+        name: "mock".to_string(),
+        enabled: true,
+        platform: PlatformConfig::Feishu {
+            app_id: "fake".into(),
+            app_secret: "fake".into(),
+        },
+        require_mention: false,
+        // R7 开关（增量 3）：本测试台演练任务功能，显式启用。
+        exec_tasks,
+        ..Default::default()
+    };
+    let mut kconfig = crate::config::Config {
+        data_dir: tmp.path().to_path_buf(),
+        channels: vec![config.clone()],
+        ..crate::config::Config::default()
+    };
+    kconfig.finalize();
+    let kernel = crate::build_kernel(&kconfig, false).await.unwrap();
+    let mock = Arc::new(MockAdapter::new("mock"));
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let hub = kernel.channel_manager().expect("channel hub configured");
+    hub.instances.insert(
+        "mock".to_string(),
+        ChannelInstance::test_instance(config.clone(), adapter),
+    );
+    let store = hub.store.clone();
+    (kernel, mock, store, config, tmp)
+}
+
+fn chan_msg(
+    chat: &str,
+    user: &str,
+    id: &str,
+    text: &str,
+    thread: Option<&str>,
+    root: Option<&str>,
+) -> ChannelMessage {
+    ChannelMessage {
+        external_chat_id: chat.to_string(),
+        external_user_id: user.to_string(),
+        external_message_id: Some(id.to_string()),
+        is_mention: true,
+        raw_text: Some(text.to_string()),
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+        image_keys: vec![],
+        thread_id: thread.map(str::to_string),
+        root_id: root.map(str::to_string),
+        parent_id: None,
+        is_group: true,
+        create_time: None,
+        doc_comment: None,
+    }
+}
+
+async fn session_count(kernel: &Kernel) -> usize {
+    kernel
+        .list_sessions(
+            None,
+            crate::storage::session::SessionListScope::All,
+            None,
+            100,
+        )
+        .await
+        .unwrap()
+        .sessions
+        .len()
+}
+
+fn output_text(out: &crate::types::ToolOutput) -> String {
+    out.contents.iter().filter_map(|b| b.as_text()).collect()
+}
+
+// ── 解析（组件 3a）─────────────────────────────────────────────
+
+#[test]
+fn parse_task_command() {
+    use crate::channels::hub_command::{parse_channel_command, ChannelCommand};
+
+    assert!(matches!(
+        parse_channel_command(Some("/task")),
+        ChannelCommand::InvalidTaskCommand
+    ));
+    // 缺省 provider = kimi；goal 原文保留。
+    match parse_channel_command(Some("/task 修复 登录页 校验")) {
+        ChannelCommand::Task { provider, goal } => {
+            assert_eq!(provider, crate::exec::ExecProvider::Kimi);
+            assert_eq!(goal, "修复 登录页 校验");
+        }
+        _ => panic!("expected Task"),
+    }
+    // 显式 codex 前缀。
+    match parse_channel_command(Some("/task codex 跑全量测试")) {
+        ChannelCommand::Task { provider, goal } => {
+            assert_eq!(provider, crate::exec::ExecProvider::Codex);
+            assert_eq!(goal, "跑全量测试");
+        }
+        _ => panic!("expected Task"),
+    }
+    // 只有前缀没有 goal → usage。
+    assert!(matches!(
+        parse_channel_command(Some("/task kimi")),
+        ChannelCommand::InvalidTaskCommand
+    ));
+    // 命令表/help 收录。
+    assert!(crate::channels::hub_command::HELP_TEXT.contains("/task"));
+}
+
+// ── 规格测试 1：双入口同 dedup_key → 同一 task，第二张卡不发出 ──
+
+#[tokio::test]
+async fn dual_entry_same_dedup_key_converges_to_one_task() {
+    let (kernel, mock, store, config, tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    // 入口 A：slash `/task`（dedup 凭据 = 触发消息 id "m1"）。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 修复登录页校验", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reply.contains("任务已创建"), "{reply}");
+    assert_eq!(
+        mock.cards.lock().await.len(),
+        1,
+        "slash entry posts one card"
+    );
+
+    let slash_task = kernel
+        .exec_task_store()
+        .find_by_dedup("mock", "m1")
+        .await
+        .unwrap()
+        .expect("task registered by the slash entry");
+
+    // 入口 B：`task_create` 工具（同一创建意图跨入口传递 → 同 dedup_key）。
+    let sid = kernel
+        .create_session(crate::kernel::CreateSessionInput {
+            project_id: None,
+            working_dir: None,
+            auto_approve_level: None,
+            tool_blocklist: vec![],
+            model_key: None,
+            context_window: None,
+        })
+        .await
+        .unwrap();
+    store
+        .save_mapping("mock", "oc_1", &sid, "oc_1", None, MappingKind::Normal)
+        .await
+        .unwrap();
+    let tool = TaskCreateTool::new(kernel.channel_manager(), Arc::downgrade(&kernel));
+    let out = tool
+        .exec(
+            serde_json::json!({"goal": "修复登录页校验", "dedup_key": "m1"}),
+            ToolExecCtx::new("tc-1", tmp.path(), sid.0.clone()),
+        )
+        .await
+        .unwrap();
+    let out: serde_json::Value = serde_json::from_str(&output_text(&out)).unwrap();
+    assert_eq!(out["state"], "existing", "{out}");
+    assert_eq!(out["created"], false, "{out}");
+    assert_eq!(out["task_id"], slash_task.id.as_str(), "{out}");
+
+    // 第二张卡未发出（C1：重送不重复发卡）。
+    assert_eq!(mock.cards.lock().await.len(), 1, "no second card");
+
+    kernel.stop().await;
+}
+
+// ── 规格测试 2：/task 空 goal → usage；任务 Thread 内 /task → 拒绝 ──
+
+#[tokio::test]
+async fn task_command_usage_and_nesting_refusal() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    // 空 goal → usage。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m0", "/task", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reply.contains("Usage: `/task"), "{reply}");
+    assert!(kernel
+        .exec_task_store()
+        .find_by_dedup("mock", "m0")
+        .await
+        .unwrap()
+        .is_none());
+
+    // 顶层建任务（卡 = "card-1" = Thread 锚）。
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+
+    // 任务 Thread 内 /task → 拒绝嵌套，且不新建任务。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t1",
+            "/task 嵌套一个",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reply.contains("不支持在任务 Thread 内再建任务"), "{reply}");
+    assert!(
+        kernel
+            .exec_task_store()
+            .find_by_dedup("mock", "t1")
+            .await
+            .unwrap()
+            .is_none(),
+        "nested /task must not register a task"
+    );
+    assert_eq!(
+        mock.cards.lock().await.len(),
+        1,
+        "no card for the nested attempt"
+    );
+
+    kernel.stop().await;
+}
+
+// ── 规格测试 3：工具无通道会话 → 仅登记 no_channel，store 可读 ──
+
+#[tokio::test]
+async fn tool_without_channel_registers_no_channel() {
+    let (kernel, _mock, _store, _config, tmp) = task_harness().await;
+    let tool = TaskCreateTool::new(kernel.channel_manager(), Arc::downgrade(&kernel));
+
+    let out = tool
+        .exec(
+            serde_json::json!({"goal": "无通道会话里的交办", "provider": "codex"}),
+            ToolExecCtx::new("tc-2", tmp.path(), "sess-unrouted".to_string()),
+        )
+        .await
+        .unwrap();
+    let out: serde_json::Value = serde_json::from_str(&output_text(&out)).unwrap();
+    assert_eq!(out["state"], "no_channel", "{out}");
+    assert_eq!(out["created"], true, "{out}");
+    assert_eq!(out["provider"], "codex", "{out}");
+
+    // 仅登记：store 可读，thread/card 字段为空（C2 半完成态如实）。
+    let task_id = out["task_id"].as_str().unwrap();
+    let task = kernel
+        .exec_task_store()
+        .get(&crate::types::ExecTaskId::from(task_id.to_string()))
+        .await
+        .unwrap()
+        .expect("task readable from the store");
+    assert_eq!(task.channel_name, "skill");
+    assert_eq!(task.thread_root_msg_id, None);
+    assert_eq!(task.card_msg_id, None);
+
+    // goal 空 → 明确报错（Kernel::create_exec_task 的入口校验）。
+    let err = tool
+        .exec(
+            serde_json::json!({"goal": "   "}),
+            ToolExecCtx::new("tc-3", tmp.path(), "sess-unrouted".to_string()),
+        )
+        .await;
+    assert!(err.is_err(), "empty goal rejected");
+
+    kernel.stop().await;
+}
+
+// ── 规格测试 4：任务 Thread 分流 + 受理登记（含归档拒收）──────────
+
+#[tokio::test]
+async fn task_thread_diversion_accepts_in_order_and_skips_chat() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    // 顶层 /task 建任务：卡 "card-1" 即 Thread 锚。
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    let task = kernel
+        .exec_task_store()
+        .find_by_dedup("mock", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.thread_root_msg_id.as_deref(), Some("card-1"));
+    let sessions_before = session_count(&kernel).await;
+
+    // Thread 输入 1：分流受理，不进 chat。增量 3 起受理即派发：
+    // 本输入立即取得资格开跑（Sim 挂起模式 → Running 不动），
+    // 受理计数以受理时刻为准记 1，随后队首被消费出队。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t1",
+            "先做第一步",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply, None, "diverted messages produce no chat reply");
+    {
+        let updated = mock.updated_cards.lock().await;
+        assert_eq!(updated.len(), 1, "accept refreshes the card via PATCH");
+        assert_eq!(updated[0].0, "card-1");
+        assert!(updated[0].1.contains("1 条"), "{}", updated[0].1);
+        assert!(updated[0].1.contains("重启不保留"), "{}", updated[0].1);
+    }
+    // 受理→派发（增量 3）：t1 已开跑，原生身份完成绑定（N2）。
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| (r.status, r.text.as_str())),
+        Some((crate::exec::RunStatus::Running, "先做第一步"))
+    );
+    let bound = kernel
+        .exec_task_store()
+        .get(&task.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(bound.binding, crate::exec::BindingState::Bound);
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        0,
+        "dispatched input consumed"
+    );
+
+    // Thread 输入 2：有序受理；A 在飞（挂起）→ 排队不派发。
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_2",
+            "t2",
+            "再补个背景",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    let snapshot = kernel.exec_inbox().snapshot(&task.id);
+    assert_eq!(snapshot.len(), 1, "t1 dispatched, only t2 queued");
+    assert_eq!(snapshot[0].seq, 2);
+    assert_eq!(snapshot[0].msg_id, "t2");
+    assert_eq!(snapshot[0].text, "再补个背景");
+    assert_eq!(snapshot[0].sender_open_id, "ou_2");
+    {
+        let updated = mock.updated_cards.lock().await;
+        assert_eq!(updated.len(), 2);
+        assert!(updated[1].1.contains("1 条"), "{}", updated[1].1);
+    }
+
+    // 同 msg_id 重送 → Duplicate：inbox 不动，卡不重复 PATCH。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t1",
+            "先做第一步",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply, None, "duplicate resend is silent");
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        1,
+        "resend not re-accepted"
+    );
+    assert_eq!(
+        mock.updated_cards.lock().await.len(),
+        2,
+        "no PATCH on duplicate"
+    );
+
+    // 全程未建 chat session / mapping（分流绝不进 chat 路径）。
+    assert_eq!(
+        session_count(&kernel).await,
+        sessions_before,
+        "no chat session created for task-thread messages"
+    );
+    assert!(
+        store.list_mappings("mock").await.unwrap().is_empty(),
+        "no session mapping created"
+    );
+
+    // 归档 → 线程内拒收（不删历史）。
+    kernel.exec_task_store().archive(&task.id).await.unwrap();
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t3",
+            "归档后再来",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reply.contains("任务已归档"), "{reply}");
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        1,
+        "archived task accepts nothing"
+    );
+
+    kernel.stop().await;
+}
+
+// ── 规格测试 5：未命中任务 root 的 Thread 消息 → 原 chat 路径 ──────
+
+#[tokio::test]
+async fn non_task_thread_message_takes_the_chat_path() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    // 先建一个任务（其 Thread 锚是 "card-1"），再造一条无关 Thread。
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    let task = kernel
+        .exec_task_store()
+        .find_by_dedup("mock", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // 普通 Thread 消息（root 不命中任何任务）→ 走原 chat 路径：
+    // 为该 Thread 建出 session + mapping（冒烟：chat 行为原样）。
+    let sessions_before = session_count(&kernel).await;
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "u1",
+            "随便聊聊",
+            Some("omt_2"),
+            Some("om_other"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session_count(&kernel).await,
+        sessions_before + 1,
+        "chat path creates a session for the plain thread"
+    );
+    assert!(
+        store.find_mapping("mock", "omt_2").await.unwrap().is_some(),
+        "chat path saves the thread mapping"
+    );
+    // 与任务互不影响：任务 inbox 仍为空，任务卡未被 PATCH。
+    assert_eq!(kernel.exec_inbox().len(&task.id), 0);
+    assert!(mock.updated_cards.lock().await.is_empty());
+
+    kernel.stop().await;
+}
+
+// ── 规格测试 3b 附：exec_task_store 配好才注册 task_create ─────────
+
+#[tokio::test]
+async fn task_create_tool_registered_only_with_exec_task_store() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    run_migrations(&pool).await.unwrap();
+    let store: Arc<dyn crate::exec::ExecTaskStore> = Arc::new(SqliteExecTaskStore::new(pool));
+
+    let shared = |with_store: bool| {
+        let shared = crate::agent::AgentShared::with_data_dir(
+            Arc::new(std::collections::BTreeMap::new()),
+            "m".to_string(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![],
+            None,
+            None,
+            std::path::PathBuf::from("/tmp"),
+        );
+        Arc::new(if with_store {
+            shared.with_exec_task_store(Some(Arc::clone(&store)))
+        } else {
+            shared
+        })
+    };
+    let bus = crate::comms::EventBus::new();
+    let handle = bus.handle(SessionId::new());
+    let registry = |shared: &Arc<crate::agent::AgentShared>| {
+        crate::tools::ToolRegistry::new().with_standard_tools(crate::tools::ToolRegistryConfig {
+            shared,
+            event_bus: &handle,
+            session_id: "s1",
+            input_bus: None,
+            file_state_store: None,
+            tool_blocklist: vec![],
+            flags: crate::tools::ToolFlags::default(),
+        })
+    };
+
+    assert!(registry(&shared(true)).has(TASK_CREATE_TOOL_NAME));
+    assert!(!registry(&shared(false)).has(TASK_CREATE_TOOL_NAME));
+}
+
+// ── 增量 3 场景 9：功能开关（R7）──────────────────────────────
+
+/// `exec_tasks=false`：`/task` 明确拒绝（不登记、不发卡）；用法错误
+/// 的 `/task` 同样拒绝（不展示已关闭功能的用法）。
+#[tokio::test]
+async fn exec_tasks_off_task_command_refused() {
+    let (kernel, mock, store, config, _tmp) = task_harness_with_exec_tasks(false).await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reply.contains("未启用执行任务功能"), "{reply}");
+    assert!(
+        kernel
+            .exec_task_store()
+            .find_by_dedup("mock", "m1")
+            .await
+            .unwrap()
+            .is_none(),
+        "refused /task must not register a task"
+    );
+    assert!(mock.cards.lock().await.is_empty(), "no card posted");
+
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg("oc_1", "ou_1", "m2", "/task", None, None),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(reply.contains("未启用执行任务功能"), "{reply}");
+
+    kernel.stop().await;
+}
+
+/// `exec_tasks=false`：**未命中任务**的 Thread 消息落回原 chat
+/// 路径（增量 6 语义收窄：「落回 chat」仅适用于未命中任务的消
+/// 息——即使登记里存在任务锚，只要本消息不在任务 Thread 内，
+/// 行为与增量 3 一致：建 chat session + mapping，不受理进
+/// inbox）。
+#[tokio::test]
+async fn exec_tasks_off_non_task_thread_message_falls_back_to_chat() {
+    let (kernel, mock, store, config, _tmp) = task_harness_with_exec_tasks(false).await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    // 直接在登记里造一个带 Thread 锚的任务（绕过已关闭的 /task），
+    // 证明未命中的消息不受其影响。
+    let (task, created) = kernel
+        .exec_task_store()
+        .create(&crate::exec::CreateExecTask {
+            channel_name: "mock".to_string(),
+            provider: crate::exec::ExecProvider::Kimi,
+            goal: "存量任务".to_string(),
+            working_dir: None,
+            created_by: "ou_1".to_string(),
+            source: crate::exec::ExecTaskSource::Entry,
+            dedup_key: "legacy".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(created);
+    kernel
+        .exec_task_store()
+        .set_thread_and_card(&task.id, "card-x", "card-x")
+        .await
+        .unwrap();
+
+    // root 不命中任何任务锚的 Thread 消息 → 落回 chat 路径：建
+    // session + mapping，inbox 不受理，卡不 PATCH。
+    let sessions_before = session_count(&kernel).await;
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "u1",
+            "开关关了之后在别的 Thread 聊",
+            Some("omt_1"),
+            Some("om_other"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session_count(&kernel).await,
+        sessions_before + 1,
+        "non-task thread: plain chat path creates a session"
+    );
+    assert!(
+        store.find_mapping("mock", "omt_1").await.unwrap().is_some(),
+        "non-task thread: chat mapping saved"
+    );
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        0,
+        "non-task thread: nothing accepted into the inbox"
+    );
+    assert!(mock.updated_cards.lock().await.is_empty());
+
+    kernel.stop().await;
+}
+
+/// `exec_tasks=false`：**命中任务**的 Thread 消息 → 明确拒收
+/// （增量 6 语义修正，N12/P6：任务保留，输入未受理，不掉回普通
+/// Chat——查看与安全收尾，不建 chat session）。
+#[tokio::test]
+async fn exec_tasks_off_task_thread_hit_refused_without_chat_fallback() {
+    let (kernel, mock, store, config, _tmp) = task_harness_with_exec_tasks(false).await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let obs = Arc::new(ObsTracker::new());
+
+    // 存量任务（开关关闭前建的）带 Thread 锚 "card-x"。
+    let (task, created) = kernel
+        .exec_task_store()
+        .create(&crate::exec::CreateExecTask {
+            channel_name: "mock".to_string(),
+            provider: crate::exec::ExecProvider::Kimi,
+            goal: "存量任务".to_string(),
+            working_dir: None,
+            created_by: "ou_1".to_string(),
+            source: crate::exec::ExecTaskSource::Entry,
+            dedup_key: "legacy".to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(created);
+    kernel
+        .exec_task_store()
+        .set_thread_and_card(&task.id, "card-x", "card-x")
+        .await
+        .unwrap();
+
+    // 命中锚的 Thread 消息 → 明确拒收文本；无 chat session 创
+    // 建、无 mapping、不受理、不 PATCH 卡。
+    let sessions_before = session_count(&kernel).await;
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store,
+        Arc::clone(&kernel),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "u1",
+            "开关关了之后再来",
+            Some("omt_1"),
+            Some("card-x"),
+        ),
+        &obs,
+        &adapter,
+    )
+    .await
+    .unwrap()
+    .expect("task hit with the flag off gets an explicit refusal");
+    assert!(reply.contains("已关闭执行任务功能"), "{reply}");
+    assert!(reply.contains("任务保留，输入未受理"), "{reply}");
+    assert_eq!(
+        session_count(&kernel).await,
+        sessions_before,
+        "no chat session created for a refused task-thread message"
+    );
+    assert!(
+        store.list_mappings("mock").await.unwrap().is_empty(),
+        "no chat mapping saved"
+    );
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        0,
+        "refused input not accepted"
+    );
+    assert!(mock.updated_cards.lock().await.is_empty());
+
+    kernel.stop().await;
+}
+
+/// `exec_tasks=false`：`task_create` 工具按路由到的通道配置拒绝
+/// （state=disabled，未登记）；无通道路由的本地会话仍允许（仅登记）。
+#[tokio::test]
+async fn exec_tasks_off_task_create_tool_refused() {
+    let (kernel, _mock, store, _config, tmp) = task_harness_with_exec_tasks(false).await;
+    let tool = TaskCreateTool::new(kernel.channel_manager(), Arc::downgrade(&kernel));
+
+    // 有通道路由（mock 通道 exec_tasks=false）→ 拒绝，不登记。
+    let sid = kernel
+        .create_session(crate::kernel::CreateSessionInput {
+            project_id: None,
+            working_dir: None,
+            auto_approve_level: None,
+            tool_blocklist: vec![],
+            model_key: None,
+            context_window: None,
+        })
+        .await
+        .unwrap();
+    store
+        .save_mapping("mock", "oc_1", &sid, "oc_1", None, MappingKind::Normal)
+        .await
+        .unwrap();
+    let out = tool
+        .exec(
+            serde_json::json!({"goal": "通道关闭时的交办", "dedup_key": "k-off"}),
+            ToolExecCtx::new("tc-off", tmp.path(), sid.0.clone()),
+        )
+        .await
+        .unwrap();
+    let out: serde_json::Value = serde_json::from_str(&output_text(&out)).unwrap();
+    assert_eq!(out["state"], "disabled", "{out}");
+    assert!(
+        kernel
+            .exec_task_store()
+            .find_by_dedup("mock", "k-off")
+            .await
+            .unwrap()
+            .is_none(),
+        "disabled channel: task must not be registered"
+    );
+
+    // 无通道路由的本地会话 → 允许（仅登记 no_channel）。
+    let out = tool
+        .exec(
+            serde_json::json!({"goal": "本地会话的交办"}),
+            ToolExecCtx::new("tc-local", tmp.path(), "sess-unrouted".to_string()),
+        )
+        .await
+        .unwrap();
+    let out: serde_json::Value = serde_json::from_str(&output_text(&out)).unwrap();
+    assert_eq!(out["state"], "no_channel", "{out}");
+    assert_eq!(out["created"], true, "{out}");
+
+    kernel.stop().await;
+}
+
+// ══ chat-flow 增量 4：卡面控制（按钮 + 回调 + 事件驱动刷新）══════
+//
+// 设计依据 docs/design/chat-flow-technical-design.md C6/C9/N6/N7/R4
+// 与 docs/design/chat-flow-impl/inc-4-spec.md 测试节：回调逐维重核、
+// 事件只是提示（锁内重读快照渲染）、PATCH 失败只 warn。
+
+use crate::channels::CardAction;
+
+/// 构造一次主卡按钮回调（直连 handler，形态与 hub `exec_` 臂分发
+/// 后一致：用户闸已在分发前统一施加，这里不重复演练）。
+fn exec_action(chat: &str, user: &str, value: serde_json::Value) -> CardAction {
+    CardAction {
+        operator_open_id: user.to_string(),
+        operator_union_id: None,
+        chat_id: Some(chat.to_string()),
+        message_id: Some("card-1".to_string()),
+        token: None,
+        value,
+    }
+}
+
+/// 最近一次回调反馈文本（toast 走 `send_action_denial` → 点击所
+/// 在群的文字消息）。
+async fn last_toast(mock: &MockAdapter) -> String {
+    mock.outgoing
+        .lock()
+        .await
+        .last()
+        .and_then(|(_, blocks)| match blocks.first() {
+            Some(ContentBlock::Text { text }) => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// 任务绑定的原生身份（N2：持久化绑定；SimControl 注入终态的定
+/// 位凭据）。
+async fn native_id_of(kernel: &Kernel, task_id: &crate::types::ExecTaskId) -> String {
+    kernel
+        .exec_task_store()
+        .get(task_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .provider_session_id
+        .expect("bound after first dispatch")
+}
+
+/// 轮询等待异步事实成立（终态经 sink → 泵 → lane、relay PATCH 都
+/// 是异步到达；最长约 3s，超时返回 false 让断言给出上下文）。
+async fn wait_until<F, Fut>(mut cond: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..60 {
+        if cond().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// 建任务 + 两条 Thread 输入：t1 立即派发（Sim 挂起 → Running），
+/// t2 排队。返回任务。
+async fn task_with_running_and_queued(
+    kernel: &Arc<Kernel>,
+    store: &Arc<dyn ChannelStore>,
+    config: &ChannelConfig,
+    adapter: &Arc<dyn PlatformAdapter>,
+) -> crate::exec::ExecTask {
+    let obs = Arc::new(ObsTracker::new());
+    handle_incoming_message(
+        "mock",
+        config,
+        store,
+        Arc::clone(kernel),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        adapter,
+    )
+    .await
+    .unwrap();
+    let task = kernel
+        .exec_task_store()
+        .find_by_dedup("mock", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    for (id, text) in [("t1", "先做第一步"), ("t2", "再补个背景")] {
+        handle_incoming_message(
+            "mock",
+            config,
+            store,
+            Arc::clone(kernel),
+            chan_msg("oc_1", "ou_1", id, text, Some("omt_1"), Some("card-1")),
+            &obs,
+            adapter,
+        )
+        .await
+        .unwrap();
+    }
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| (r.status, r.text.as_str())),
+        Some((crate::exec::RunStatus::Running, "先做第一步")),
+        "t1 dispatched and hanging (sim hang mode)"
+    );
+    assert_eq!(kernel.exec_inbox().len(&task.id), 1, "t2 queued");
+    task
+}
+
+fn stop_value(task: &crate::exec::ExecTask, run: &str, gen: i64) -> serde_json::Value {
+    serde_json::json!({
+        "action": "exec_stop",
+        "task": task.id.as_str(),
+        "run": run,
+        "gen": gen,
+    })
+}
+
+fn resume_value(task: &crate::exec::ExecTask, gen: i64) -> serde_json::Value {
+    serde_json::json!({
+        "action": "exec_resume",
+        "task": task.id.as_str(),
+        "run": null,
+        "gen": gen,
+    })
+}
+
+// ── 增量 4 场景 1：按钮全流程（停止并暂停 → 幂等重复）──────────
+
+#[tokio::test]
+async fn exec_stop_button_full_flow_and_idempotent_repeat() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let run_id = kernel
+        .exec_scheduler()
+        .snapshot(&task.id)
+        .current
+        .unwrap()
+        .run_id
+        .as_str()
+        .to_string();
+
+    // 点 ⏹ 停止并暂停：toast 受理 + 卡面「停止中」+ inbox 保留。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, &run_id, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("已受理：停止中，队列已暂停"), "{toast}");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Stopping),
+        "停止中 ≠ 已停止（C6）"
+    );
+    assert!(snap.paused, "队列已暂停");
+    assert_eq!(
+        kernel.exec_inbox().len(&task.id),
+        1,
+        "排队输入保留（停止不回滚队列）"
+    );
+    {
+        let updated = mock.updated_cards.lock().await;
+        let last = &updated.last().expect("card refreshed after stop").1;
+        assert!(last.contains("停止中 · 第 1 轮"), "{last}");
+        assert!(last.contains("已暂停 · 进程内 · 重启不保留"), "{last}");
+        assert!(!last.contains("behaviors"), "Stopping 不出按钮: {last}");
+    }
+
+    // 重复点：幂等——同一受理 toast，不重复 cancel。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, &run_id, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("已受理：停止中，队列已暂停"), "{toast}");
+    let control = kernel.exec_sim_control().expect("sim control present");
+    assert_eq!(
+        control.cancelled_sessions().len(),
+        1,
+        "幂等：重复停止不重复 cancel"
+    );
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Stopping)
+    );
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 2：Stopping 受阻 → cancel 确认 → 恢复派发 ──────
+
+#[tokio::test]
+async fn exec_resume_blocked_until_cancel_confirmed_then_resumes() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    // 事件 relay 上岗（事件驱动刷新的被测对象之一）。
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let run_id = kernel
+        .exec_scheduler()
+        .snapshot(&task.id)
+        .current
+        .unwrap()
+        .run_id
+        .as_str()
+        .to_string();
+    let control = kernel.exec_sim_control().unwrap();
+
+    // 先停（Sim 挂起模式：cancel 受理但永不确认 → Stopping 持续）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, &run_id, 0)),
+    )
+    .await;
+
+    // Stopping 中点 ▶ → toast 受阻、仍 paused、不预约自动恢复。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", resume_value(&task, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(
+        toast.contains("停止尚未确认，保持暂停；确认后请再次恢复"),
+        "{toast}"
+    );
+    assert!(
+        kernel.exec_scheduler().snapshot(&task.id).paused,
+        "受阻后仍 paused"
+    );
+    assert_eq!(
+        control.cancelled_sessions().len(),
+        1,
+        "受阻的 resume 不触发任何新动作"
+    );
+
+    // cancel 确认到达（SimControl 注入）→ 卡面「已停止」、仍 paused。
+    control.cancel_confirms(&native_id_of(&kernel, &task.id).await);
+    let tid = task.id.clone();
+    assert!(
+        wait_until(|| {
+            let kernel = &kernel;
+            let tid = &tid;
+            async move {
+                kernel
+                    .exec_scheduler()
+                    .snapshot(tid)
+                    .current
+                    .as_ref()
+                    .map(|r| r.status)
+                    == Some(crate::exec::RunStatus::Stopped)
+            }
+        })
+        .await,
+        "cancel confirmation settles the run as Stopped"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("已停止 · 第 1 轮"))
+        })
+        .await,
+        "relay refreshes the card to 已停止"
+    );
+    assert!(
+        kernel.exec_scheduler().snapshot(&task.id).paused,
+        "终态后队列暂停独立保留（C6）"
+    );
+
+    // 再点 ▶ → 已恢复，继续执行；t2 派发。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", resume_value(&task, 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("已恢复，继续执行"), "{toast}");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert!(!snap.paused);
+    assert_eq!(
+        snap.current.as_ref().map(|r| (r.status, r.text.as_str())),
+        Some((crate::exec::RunStatus::Running, "再补个背景")),
+        "恢复后派发下一条（不重试已停止轮，D3）"
+    );
+    assert_eq!(kernel.exec_inbox().len(&task.id), 0, "t2 consumed");
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 3：旧回调（代次/任务/Run 失配）→ 拒绝零副作用 ──
+
+#[tokio::test]
+async fn stale_exec_action_toasts_and_changes_nothing() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+    let patches_before = mock.updated_cards.lock().await.len();
+
+    // gen+1 伪造（旧代卡）→ 过期 toast，零副作用。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, "run_whatever", 1)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("卡片已过期，操作未生效"), "{toast}");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Running),
+        "旧代回调不动任何状态"
+    );
+    assert!(!snap.paused);
+    assert!(control.cancelled_sessions().is_empty());
+
+    // 任务不存在 → 同一过期 toast。
+    let ghost = serde_json::json!({
+        "action": "exec_stop", "task": "task_ghost", "run": "run_x", "gen": 0,
+    });
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", ghost),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("卡片已过期，操作未生效"), "{toast}");
+
+    // run 不匹配的 exec_stop → RunMismatch toast、当前 Run 不受扰
+    // （不取消任何 Run；暂停先生效——stop 语义先于匹配核对，C6）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", stop_value(&task, "run_bogus", 0)),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(
+        toast.contains("目标轮次已变化（当前第 1 轮状态 执行中），未执行停止"),
+        "{toast}"
+    );
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Running),
+        "当前 Run 不受扰"
+    );
+    assert!(snap.paused, "暂停已生效（stop 语义在先）");
+    assert!(
+        control.cancelled_sessions().is_empty(),
+        "失配不取消任何 Run"
+    );
+
+    // 三次拒绝均未产生卡面 PATCH（拒绝路径零呈现副作用；过期/失
+    // 配刷新只发生在状态确有变化的分支——失配分支刷的是同一事
+    // 实，但前两次纯拒绝不得有 PATCH）。
+    let patches_after = mock.updated_cards.lock().await.len();
+    assert!(
+        patches_after <= patches_before + 1,
+        "stale rejections stay silent (only RunMismatch refreshes): {patches_before} -> {patches_after}"
+    );
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 4：事件驱动刷新 + 未暂停自动派发下一条 ─────────
+
+#[tokio::test]
+async fn terminal_event_drives_card_refresh_and_next_dispatch() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+    let native = native_id_of(&kernel, &task.id).await;
+
+    // t1 自然完成（队列仍有 t2、未暂停）→ relay 刷新；调度器自动
+    // 派发 t2，卡面跟进到「执行中 · 第 2 轮」（N3：不自动暂停）。
+    control.complete(&native);
+    let tid = task.id.clone();
+    assert!(
+        wait_until(|| {
+            let kernel = &kernel;
+            let tid = &tid;
+            async move {
+                kernel
+                    .exec_scheduler()
+                    .snapshot(tid)
+                    .current
+                    .as_ref()
+                    .map(|r| (r.status, r.text.as_str()))
+                    == Some((crate::exec::RunStatus::Running, "再补个背景"))
+            }
+        })
+        .await,
+        "terminal with queued input auto-dispatches the next run (not paused)"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("执行中 · 第 2 轮"))
+        })
+        .await,
+        "relay-driven card follows the new run"
+    );
+    assert_eq!(kernel.exec_inbox().len(&task.id), 0, "t2 consumed");
+
+    // 空队列下的完成：卡面如实落在「第 N 轮已结束（完成）」。
+    control.complete(&native);
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("第 2 轮已结束（完成）"))
+        })
+        .await,
+        "relay refreshes the card to 已结束（完成）"
+    );
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Completed)
+    );
+    assert!(!snap.paused, "自然完成不自动暂停（N3）");
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 场景 5：归档任务 / 关闭通道 → 回调拒绝 ──────────────
+
+#[tokio::test]
+async fn archived_task_and_disabled_channel_reject_actions() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+
+    // 归档 → 回调一律 toast「任务已归档」，零状态变更。
+    kernel.exec_task_store().archive(&task.id).await.unwrap();
+    for value in [resume_value(&task, 0), stop_value(&task, "run_whatever", 0)] {
+        crate::channels::taskcard::handle_exec_action(
+            "mock",
+            &config,
+            &kernel,
+            &adapter,
+            exec_action("oc_1", "ou_1", value),
+        )
+        .await;
+        let toast = last_toast(&mock).await;
+        assert!(toast.contains("任务已归档"), "{toast}");
+    }
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert!(
+        !snap.paused && control.cancelled_sessions().is_empty(),
+        "archived task: zero state change"
+    );
+    kernel.stop().await;
+
+    // exec_tasks=false 通道：回调拒绝（拒绝先于任何 store 读写）。
+    let (kernel, mock, _store, config, _tmp) = task_harness_with_exec_tasks(false).await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let ghost = serde_json::json!({
+        "action": "exec_resume", "task": "task_ghost", "run": null, "gen": 0,
+    });
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action("oc_1", "ou_1", ghost),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("未启用执行任务功能"), "{toast}");
+
+    kernel.stop().await;
+}
+
+// ── 增量 4 附：PATCH 失败只 warn——不改任务状态、无重试风暴 ─────
+
+#[tokio::test]
+async fn relay_patch_failure_warns_only_and_never_mutates_state() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().unwrap();
+    let native = native_id_of(&kernel, &task.id).await;
+
+    // 平台 PATCH 故障：终态照常收口（呈现失败不影响事实），失败
+    // 的 PATCH 不进入记录（mock 只记成功）。
+    mock.fail_updates
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let calls_before = mock.update_calls.load(std::sync::atomic::Ordering::Relaxed);
+    control.complete(&native);
+    let tid = task.id.clone();
+    assert!(
+        wait_until(|| {
+            let kernel = &kernel;
+            let tid = &tid;
+            async move {
+                kernel
+                    .exec_scheduler()
+                    .snapshot(tid)
+                    .current
+                    .as_ref()
+                    .map(|r| (r.status, r.text.as_str()))
+                    == Some((crate::exec::RunStatus::Running, "再补个背景"))
+            }
+        })
+        .await,
+        "state settles regardless of patch failures (C9: 呈现待同步)"
+    );
+    assert!(
+        !mock
+            .updated_cards
+            .lock()
+            .await
+            .iter()
+            .any(|(_, c)| c.contains("第 1 轮已结束")),
+        "failed patches never land"
+    );
+
+    // 无重试风暴：等 relay 至少处理了一个事件（失败的 PATCH 也
+    // 计入调用数），随后静默期内调用数不再增长（下一事件自然带
+    // 来新快照，而不是原地重试）。
+    assert!(
+        wait_until(|| async {
+            mock.update_calls.load(std::sync::atomic::Ordering::Relaxed) > calls_before
+        })
+        .await,
+        "relay attempted patches (and failed)"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let settled = mock.update_calls.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        settled - calls_before <= 4,
+        "bounded patch attempts (one per hint): {calls_before} -> {settled}"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(
+        mock.update_calls.load(std::sync::atomic::Ordering::Relaxed),
+        settled,
+        "no retry storm after a failed patch"
+    );
+
+    kernel.stop().await;
+}
+
+// ══ chat-flow 增量 6：受理凭据跨重启（C1/N12/D2）══════════════
+
+/// 重启测试的装配助手：与 `task_harness` 同一通道配置，但 kernel
+/// 建在指定 data_dir 上——同一目录先后建两个 kernel 即「重启」
+/// （inbox/lane 进程内清空；登记/绑定/事实/凭据持久保留）。
+fn task_kconfig(tmp: &tempfile::TempDir) -> (crate::config::Config, ChannelConfig) {
+    let config = ChannelConfig {
+        name: "mock".to_string(),
+        enabled: true,
+        platform: PlatformConfig::Feishu {
+            app_id: "fake".into(),
+            app_secret: "fake".into(),
+        },
+        require_mention: false,
+        exec_tasks: true,
+        ..Default::default()
+    };
+    let mut kconfig = crate::config::Config {
+        data_dir: tmp.path().to_path_buf(),
+        channels: vec![config.clone()],
+        ..crate::config::Config::default()
+    };
+    kconfig.finalize();
+    (kconfig, config)
+}
+
+async fn boot_task_kernel(
+    kconfig: &crate::config::Config,
+    config: &ChannelConfig,
+) -> (Arc<Kernel>, Arc<MockAdapter>) {
+    let kernel = crate::build_kernel(kconfig, false).await.unwrap();
+    let mock = Arc::new(MockAdapter::new("mock"));
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    let hub = kernel.channel_manager().expect("channel hub configured");
+    hub.instances.insert(
+        "mock".to_string(),
+        ChannelInstance::test_instance(config.clone(), adapter),
+    );
+    (kernel, mock)
+}
+
+/// 增量 6 场景 1：accept 后重启（新 inbox + 新 kernel，同
+/// sqlite）→ 同 msg 重送 → 明确「未恢复、未重新执行」/「已开始
+/// 执行，不重复执行」回复，inbox 仍空、零派发；进程内重送仍静
+/// 默（N12：旧等待项不得显示为仍排队，绝不重复执行）。
+#[tokio::test]
+async fn restart_redelivery_gets_not_recovered_reply_and_never_reexecutes() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let (kconfig, config) = task_kconfig(&tmp);
+    let obs = Arc::new(ObsTracker::new());
+
+    // ── 第一进程生命周期：建任务；t1 开跑（Sim 挂起 → Running），
+    // t2 有序受理、排队未派发。
+    let (kernel1, mock1) = boot_task_kernel(&kconfig, &config).await;
+    let store1 = kernel1.channel_manager().unwrap().store();
+    let adapter1: Arc<dyn PlatformAdapter> = mock1.clone();
+    handle_incoming_message(
+        "mock",
+        &config,
+        &store1,
+        Arc::clone(&kernel1),
+        chan_msg("oc_1", "ou_1", "m1", "/task 做 A", None, None),
+        &obs,
+        &adapter1,
+    )
+    .await
+    .unwrap();
+    let task = kernel1
+        .exec_task_store()
+        .find_by_dedup("mock", "m1")
+        .await
+        .unwrap()
+        .unwrap();
+    for (id, text) in [("t1", "先做第一步"), ("t2", "再补个背景")] {
+        handle_incoming_message(
+            "mock",
+            &config,
+            &store1,
+            Arc::clone(&kernel1),
+            chan_msg("oc_1", "ou_1", id, text, Some("omt_1"), Some("card-1")),
+            &obs,
+            &adapter1,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        kernel1.exec_inbox().len(&task.id),
+        1,
+        "t1 dispatched (hang), t2 queued"
+    );
+    // 受理凭据落地：t1 已派发（started），t2 仅受理未开始。
+    let acc = kernel1
+        .exec_fact_store()
+        .acceptance_for("mock", "t1")
+        .await
+        .unwrap()
+        .expect("t1 acceptance persisted");
+    assert!(acc.started, "t1 dispatched → started");
+    let acc = kernel1
+        .exec_fact_store()
+        .acceptance_for("mock", "t2")
+        .await
+        .unwrap()
+        .expect("t2 acceptance persisted");
+    assert!(!acc.started, "t2 queued only");
+    kernel1.stop().await;
+    drop(kernel1);
+
+    // ── 第二进程生命周期（重启）：同 data_dir 重建。boot_sweep
+    // 已把 t1 的未闭合 Run 标 interrupted（N11：不凭旧 running
+    // 显示正常，不自动重跑）。
+    let (kernel2, mock2) = boot_task_kernel(&kconfig, &config).await;
+    let store2 = kernel2.channel_manager().unwrap().store();
+    let adapter2: Arc<dyn PlatformAdapter> = mock2.clone();
+    let runs = kernel2.exec_fact_store().runs_for(&task.id).await.unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        runs[0].status, "interrupted",
+        "open run marked interrupted at boot"
+    );
+
+    // t2 重送 → 明确「未恢复、未重新执行」；撤回后 inbox 仍空、
+    // 零派发、无新 Run 行（不显示仍排队、不重复执行）。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store2,
+        Arc::clone(&kernel2),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t2",
+            "再补个背景",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter2,
+    )
+    .await
+    .unwrap()
+    .expect("cross-restart redelivery gets an explicit reply");
+    assert!(reply.contains("未恢复、未重新执行"), "{reply}");
+    assert_eq!(
+        kernel2.exec_inbox().len(&task.id),
+        0,
+        "撤回后 inbox 仍空（不重新入队）"
+    );
+    assert!(
+        kernel2
+            .exec_scheduler()
+            .snapshot(&task.id)
+            .current
+            .is_none(),
+        "零派发"
+    );
+    assert_eq!(
+        kernel2
+            .exec_fact_store()
+            .runs_for(&task.id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "无新 Run 行"
+    );
+
+    // t1（已开始）重送 → 如实回答「已开始执行」，同样不重复执行。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store2,
+        Arc::clone(&kernel2),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t1",
+            "先做第一步",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter2,
+    )
+    .await
+    .unwrap()
+    .expect("started redelivery gets an explicit reply");
+    assert!(reply.contains("已开始执行"), "{reply}");
+    assert!(reply.contains("不重复执行"), "{reply}");
+    assert_eq!(kernel2.exec_inbox().len(&task.id), 0);
+    assert_eq!(
+        kernel2
+            .exec_fact_store()
+            .runs_for(&task.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 进程内重送仍静默：撤回保留了去重记忆（受理是一次性事实，
+    // C1）——第二次重送 t2 不再产生任何可见动作。
+    let reply = handle_incoming_message(
+        "mock",
+        &config,
+        &store2,
+        Arc::clone(&kernel2),
+        chan_msg(
+            "oc_1",
+            "ou_1",
+            "t2",
+            "再补个背景",
+            Some("omt_1"),
+            Some("card-1"),
+        ),
+        &obs,
+        &adapter2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reply, None, "in-process redelivery stays silent");
+    assert_eq!(kernel2.exec_inbox().len(&task.id), 0);
+
+    kernel2.stop().await;
+}
+
+// ── 增量 10：待回应区回答回调（N5/C5）─────────────────────────
+
+/// 授权请求选项（allow_once / reject_once，镜像 ACP 形态）。
+fn perm_options() -> Vec<crate::exec::ExecRequestOption> {
+    vec![
+        crate::exec::ExecRequestOption {
+            option_id: "approve_once".into(),
+            label: "Approve once".into(),
+            kind: crate::exec::ExecOptionKind::AllowOnce,
+        },
+        crate::exec::ExecRequestOption {
+            option_id: "reject".into(),
+            label: "Reject".into(),
+            kind: crate::exec::ExecOptionKind::RejectOnce,
+        },
+    ]
+}
+
+fn answer_value(
+    task: &crate::exec::ExecTask,
+    run: &str,
+    req: &str,
+    gen: i64,
+    opt: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": "exec_answer",
+        "task": task.id.as_str(),
+        "run": run,
+        "req": req,
+        "gen": gen,
+        "opt": opt,
+    })
+}
+
+#[tokio::test]
+async fn exec_answer_button_full_flow_and_revalidation() {
+    let (kernel, mock, store, config, _tmp) = task_harness().await;
+    let adapter: Arc<dyn PlatformAdapter> = mock.clone();
+    // 事件 relay 显式挂（与增量 4 场景 4 同律：RequestPending 只是
+    // 提示，卡面以锁内快照重渲染）。
+    let hub = kernel.channel_manager().expect("channel hub");
+    crate::channels::taskcard::relay::spawn_exec_relay(&hub, &kernel);
+    let task = task_with_running_and_queued(&kernel, &store, &config, &adapter).await;
+    let control = kernel.exec_sim_control().expect("sim control present");
+    let native = native_id_of(&kernel, &task.id).await;
+    let run_id = kernel
+        .exec_scheduler()
+        .snapshot(&task.id)
+        .current
+        .unwrap()
+        .run_id
+        .as_str()
+        .to_string();
+
+    // Provider 发出授权请求（经 sink 泵登记）→ WaitingRequest +
+    // 卡面待回应区（relay 按 RequestPending 提示刷新）。
+    control.raise_request(
+        &native,
+        crate::exec::ExecRequestKind::Permission,
+        "Bash: Requesting approval to Running: echo hi",
+        perm_options(),
+    );
+    let req_id = wait_until_async("request registered", || {
+        let kernel = Arc::clone(&kernel);
+        let task_id = task.id.clone();
+        async move {
+            kernel
+                .exec_scheduler()
+                .snapshot(&task_id)
+                .pending_request
+                .map(|r| r.request_id.as_str().to_string())
+        }
+    })
+    .await;
+    assert_eq!(
+        kernel
+            .exec_scheduler()
+            .snapshot(&task.id)
+            .current
+            .as_ref()
+            .map(|r| r.status),
+        Some(crate::exec::RunStatus::WaitingRequest),
+        "等回答的 Run 占有 Session（在飞）"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| c.contains("**待回应**: 授权请求：") && c.contains("exec_answer"))
+        })
+        .await,
+        "card shows pending area with answer buttons"
+    );
+
+    // C9：旧代回调 → 卡片已过期，零状态变更。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, &req_id, 99, "approve_once"),
+        ),
+    )
+    .await;
+    assert!(
+        last_toast(&mock).await.contains("卡片已过期"),
+        "old gen rejected"
+    );
+    assert_eq!(
+        kernel
+            .exec_scheduler()
+            .snapshot(&task.id)
+            .pending_request
+            .unwrap()
+            .status,
+        crate::exec::ExecRequestStatus::Pending,
+        "旧代回调零状态变更"
+    );
+
+    // 错 req → Mismatch，不交付 adapter（不批准任何操作）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, "ereq_wrong", 0, "approve_once"),
+        ),
+    )
+    .await;
+    assert!(
+        last_toast(&mock).await.contains("目标轮次或请求已变化"),
+        "wrong req → Mismatch toast"
+    );
+    assert!(control.answered_requests().is_empty(), "错配不批准任何操作");
+
+    // 正确五维 → 已提交+执行方确认（Sim 同步 ack → Resolved）；
+    // 待回应区消失、Run 回 Running。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, &req_id, 0, "approve_once"),
+        ),
+    )
+    .await;
+    assert!(
+        last_toast(&mock).await.contains("已提交，执行方已确认"),
+        "Resolved toast"
+    );
+    assert_eq!(control.answered_requests().len(), 1, "回答交付恰好一次");
+    let snap = kernel.exec_scheduler().snapshot(&task.id);
+    assert!(snap.pending_request.is_none(), "Resolved 后待回应区消失");
+    assert_eq!(
+        snap.current.as_ref().map(|r| r.status),
+        Some(crate::exec::RunStatus::Running),
+        "无 Pending 剩余 → 退出等待态"
+    );
+    assert!(
+        wait_until(|| async {
+            mock.updated_cards
+                .lock()
+                .await
+                .iter()
+                .any(|(_, c)| !c.contains("**待回应**") && c.contains("执行中 · 第 1 轮"))
+        })
+        .await,
+        "card refreshed without pending area"
+    );
+
+    // 重复点击 → Already，不重复放行（C5：一次请求只一个最终回
+    // 应）。
+    crate::channels::taskcard::handle_exec_action(
+        "mock",
+        &config,
+        &kernel,
+        &adapter,
+        exec_action(
+            "oc_1",
+            "ou_1",
+            answer_value(&task, &run_id, &req_id, 0, "approve_once"),
+        ),
+    )
+    .await;
+    let toast = last_toast(&mock).await;
+    assert!(toast.contains("不重复放行"), "{toast}");
+    assert_eq!(
+        control.answered_requests().len(),
+        1,
+        "重复回答不重复交付 adapter"
+    );
+
+    kernel.stop().await;
+}
+
+/// 异步谓词轮询（返回值的版本；5s 上限，50ms 步进）。
+async fn wait_until_async<T, F, Fut>(desc: &str, mut pred: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(v) = pred().await {
+            return v;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "等待超时：{desc}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}

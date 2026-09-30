@@ -40,6 +40,10 @@ pub struct StorageSet {
     cron_store: Arc<dyn crate::cron::CronStore>,
     /// Channel session mapping store
     channel_store: Arc<dyn crate::channels::ChannelStore>,
+    /// Exec task registry store (chat-flow W1)
+    exec_task_store: Arc<dyn crate::exec::ExecTaskStore>,
+    /// Exec run facts + result store (chat-flow W2 增量 5，N7/N9)
+    exec_fact_store: Arc<dyn crate::exec::ExecFactStore>,
     /// Disposable persistent KV cache (`cache.db`; `None` when it failed
     /// to open — cache must never take the kernel down with it).
     kv_cache: Option<Arc<crate::kv_cache::KvCache>>,
@@ -60,6 +64,8 @@ impl std::fmt::Debug for StorageSet {
             .field("favorite_store", &"<dyn FavoriteStore>")
             .field("cron_store", &"<dyn CronStore>")
             .field("channel_store", &"<dyn ChannelStore>")
+            .field("exec_task_store", &"<dyn ExecTaskStore>")
+            .field("exec_fact_store", &"<dyn ExecFactStore>")
             .field("kv_cache", &self.kv_cache.is_some())
             .finish()
     }
@@ -153,6 +159,10 @@ impl StorageSet {
         let channel_store: Arc<dyn crate::channels::ChannelStore> = Arc::new(
             crate::channels::store::SqliteChannelStore::new(pool.clone()),
         );
+        let exec_task_store: Arc<dyn crate::exec::ExecTaskStore> =
+            Arc::new(crate::exec::store::SqliteExecTaskStore::new(pool.clone()));
+        let exec_fact_store: Arc<dyn crate::exec::ExecFactStore> =
+            Arc::new(crate::exec::facts::SqliteExecFactStore::new(pool.clone()));
 
         // Ensure default workspace project exists
         let default_project_id = crate::types::ProjectId::default_workspace();
@@ -199,6 +209,8 @@ impl StorageSet {
             favorite_store,
             cron_store,
             channel_store,
+            exec_task_store,
+            exec_fact_store,
             kv_cache,
         })
     }
@@ -277,6 +289,16 @@ impl StorageSet {
     /// Get the channel store
     pub fn channel_store(&self) -> Arc<dyn crate::channels::ChannelStore> {
         self.channel_store.clone()
+    }
+
+    /// Get the exec task registry store (chat-flow W1)
+    pub fn exec_task_store(&self) -> Arc<dyn crate::exec::ExecTaskStore> {
+        self.exec_task_store.clone()
+    }
+
+    /// Get the exec run facts + result store (chat-flow W2 增量 5)
+    pub fn exec_fact_store(&self) -> Arc<dyn crate::exec::ExecFactStore> {
+        self.exec_fact_store.clone()
     }
 
     /// Get the disposable persistent KV cache (`None` when it failed to open).

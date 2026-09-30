@@ -37,6 +37,8 @@ pub struct MockAdapter {
     thread_root_cache: tokio::sync::Mutex<std::collections::HashMap<String, String>>,
     /// Cards sent: (chat, card json, reply anchor).
     pub cards: tokio::sync::Mutex<Vec<(String, String, Option<String>)>>,
+    /// Cards updated in place: (message id, card json).
+    pub updated_cards: tokio::sync::Mutex<Vec<(String, String)>>,
     /// Gates `supports_status_card` (default false → text fallback).
     pub status_card_ok: std::sync::atomic::AtomicBool,
     /// When true, `send_message` returns synthetic ids (msg-1, msg-2, …)
@@ -44,6 +46,11 @@ pub struct MockAdapter {
     /// unaffected.
     pub issue_ids: std::sync::atomic::AtomicBool,
     pub send_counter: std::sync::atomic::AtomicUsize,
+    /// `update_card` 调用计数（增量 4：断言 PATCH 无重试风暴用）。
+    pub update_calls: std::sync::atomic::AtomicUsize,
+    /// When true, `update_card` fails (platform outage)——增量 4
+    /// PATCH 失败「只 warn、不改状态」路径测试。
+    pub fail_updates: std::sync::atomic::AtomicBool,
 }
 
 impl MockAdapter {
@@ -60,9 +67,12 @@ impl MockAdapter {
             thread_root_calls: tokio::sync::Mutex::new(Vec::new()),
             thread_root_cache: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             cards: tokio::sync::Mutex::new(Vec::new()),
+            updated_cards: tokio::sync::Mutex::new(Vec::new()),
             status_card_ok: std::sync::atomic::AtomicBool::new(false),
             issue_ids: std::sync::atomic::AtomicBool::new(false),
             send_counter: std::sync::atomic::AtomicUsize::new(0),
+            update_calls: std::sync::atomic::AtomicUsize::new(0),
+            fail_updates: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -191,6 +201,25 @@ impl PlatformAdapter for MockAdapter {
             reply_msg_id.map(str::to_string),
         ));
         Ok(Some("card-1".to_string()))
+    }
+
+    async fn update_card(
+        &self,
+        message_id: &str,
+        card_json: &str,
+    ) -> std::result::Result<(), crate::channels::ChannelError> {
+        self.update_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.fail_updates.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::channels::ChannelError::Platform(
+                "mock update_card failure".into(),
+            ));
+        }
+        self.updated_cards
+            .lock()
+            .await
+            .push((message_id.to_string(), card_json.to_string()));
+        Ok(())
     }
 
     async fn download_message_image(
@@ -1176,6 +1205,7 @@ async fn test_start_and_shutdown() {
             approval_chat_id: None,
             admin_users: vec![],
             disabled_events: vec![],
+            exec_tasks: false,
         },
         ChannelConfig {
             name: "mock2".to_string(),
@@ -1197,6 +1227,7 @@ async fn test_start_and_shutdown() {
             approval_chat_id: None,
             admin_users: vec![],
             disabled_events: vec![],
+            exec_tasks: false,
         },
     ];
 

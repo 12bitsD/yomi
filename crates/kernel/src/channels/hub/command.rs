@@ -55,6 +55,8 @@ pub(crate) const CMD_CRON: &str = "/cron";
 
 pub(crate) const CMD_BIND: &str = "/bind";
 
+pub(crate) const CMD_TASK: &str = "/task";
+
 pub(crate) const CMD_SESSIONS: &str = "/sessions";
 
 pub(crate) const CMD_STATUS: &str = "/status";
@@ -88,6 +90,7 @@ pub(crate) const COMMANDS: &[(&str, &[&str])] = &[
     (CMD_SETTINGS, &[]),
     (CMD_CRON, &[]),
     (CMD_BIND, &[]),
+    (CMD_TASK, &[]),
     (CMD_SESSIONS, &[]),
     (CMD_STATUS, &[]),
     (CMD_USAGE, &["/u"]),
@@ -116,6 +119,7 @@ pub(crate) const HELP_TEXT: &str = "\
 `/mailbox` (`/mb`) — pending steer/queued messages; `/mailbox retract <n>` · `/mailbox clear [steer|queue|all]` (admin)
 `/bg` — background tasks with stop buttons; `/bg --all` spans sessions (admin)
 `/thread <text>` (`/t`) — ask in a new thread off this message (Feishu; redundant in reply-in-thread chats — every top-level message opens one)
+`/task [kimi|codex] <goal>` — register an exec task and open its card thread; follow-ups in the card's thread go to the task, not the chat (default provider kimi)
 
 **Models**
 `/models` — list configured models (current one marked)
@@ -212,6 +216,15 @@ pub(crate) enum ChannelCommand {
     Thread(String),
     /// A `/thread` command without text.
     InvalidThreadCommand,
+    /// Register an exec task (chat-flow N1 专用入口）：发占位主卡，
+    /// 卡即任务 Thread 锚。`provider` 由可选前缀 kimi|codex 指定
+    /// （缺省 kimi）。
+    Task {
+        provider: crate::exec::ExecProvider,
+        goal: String,
+    },
+    /// A `/task` command without a goal.
+    InvalidTaskCommand,
     /// Subscribe the user to run-completion notifications for this
     /// conversation scope (chat or thread), optionally redirecting the
     /// notification to another chat; `recursive` (chat level only) also
@@ -412,6 +425,25 @@ pub(crate) fn parse_channel_command(raw_text: Option<&str>) -> ChannelCommand {
                 ChannelCommand::InvalidThreadCommand
             } else {
                 ChannelCommand::Thread(rest)
+            }
+        }
+        CMD_TASK => {
+            // 可选 provider 前缀（kimi|codex，缺省 kimi）+ goal 原文。
+            // 前缀只在第一个词位置生效——goal 本身以 kimi/codex 起头
+            // 时按规格视为 provider 声明。
+            let mut words: Vec<&str> = parts.collect();
+            let mut provider = crate::exec::ExecProvider::Kimi;
+            if let Some(first) = words.first() {
+                if let Ok(p) = first.parse::<crate::exec::ExecProvider>() {
+                    provider = p;
+                    words.remove(0);
+                }
+            }
+            let goal = words.join(" ");
+            if goal.is_empty() {
+                ChannelCommand::InvalidTaskCommand
+            } else {
+                ChannelCommand::Task { provider, goal }
             }
         }
         CMD_SUBSCRIBE => {

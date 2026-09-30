@@ -1461,6 +1461,12 @@ impl PlatformAdapter for FeishuAdapter {
 
 // ── Message handlers ────────────────────────────────────────────────
 
+// chat-flow 增量 8：CardKit 请求构造（纯构造 + 既有 request 助手；
+// API 存在性有官方文档，行为未实测——P0 门槛）。子模块形态以共
+// 享本模块的私有字段与请求助手（client/base_url/api_post/api_json）。
+#[path = "feishu_cardkit.rs"]
+mod cardkit;
+
 #[cfg(test)]
 #[path = "feishu_test.rs"]
 mod tests;

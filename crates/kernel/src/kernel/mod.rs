@@ -90,6 +90,25 @@ pub struct Kernel {
     /// Disposable persistent KV cache (`cache.db`), shared with channel adapters.
     pub(crate) kv_cache: Option<Arc<crate::kv_cache::KvCache>>,
     pub(crate) channel_manager: Option<Arc<crate::channels::hub::ChannelHub>>,
+    /// Exec task registry (chat-flow W1)：执行任务登记/绑定状态机
+    /// 持久化。取自 `StorageSet`，不经 `Kernel::new` 参数。
+    exec_task_store: Arc<dyn crate::exec::ExecTaskStore>,
+    /// Run 事实 + 结果正文 store（chat-flow W2 增量 5，N7/N9）：
+    /// 调度器是唯一写入方；只读查询工具与卡面渲染经本句柄读取。
+    exec_fact_store: Arc<dyn crate::exec::ExecFactStore>,
+    /// 任务 Thread 输入的进程内受理登记（chat-flow 增量 2，D2：
+    /// 重启清空）。与 `exec_scheduler` 共享同一实例。
+    exec_inbox: crate::exec::ExecInbox,
+    /// 执行调度器（chat-flow 增量 3，N6/C3/D11）：每卡 lane 单一
+    /// 裁定者 + 全局名额统一分配。
+    exec_scheduler: Arc<crate::exec::ExecScheduler>,
+    /// `[exec]` 运行控制配置（增量 8 起保留：换代余量/sweep 周期
+    /// 等旋钮的运行时读取口；调度器构造时另取一份）。
+    exec_config: crate::config::ExecConfig,
+    /// `SimAdapter` 控制柄（chat-flow 增量 4）：仅供测试与本地驱动
+    /// 注入终态——生产挂起模式下不调用即无行为；P3 真实 adapter
+    /// 替换后恒 None。
+    exec_sim_control: Option<crate::exec::SimControl>,
     /// `ext_route` 的内存回退路由表（无 channel store 时）：(source, key)
     /// → session。纯内存，daemon 重启后首个 emit 重建映射。
     ext_routes: dashmap::DashMap<(String, String), SessionId>,
@@ -141,6 +160,64 @@ impl Kernel {
     /// Get the channel manager (if channels are configured).
     pub fn channel_manager(&self) -> Option<Arc<crate::channels::hub::ChannelHub>> {
         self.channel_manager.clone()
+    }
+
+    /// Get the exec task registry store (chat-flow W1).
+    pub fn exec_task_store(&self) -> Arc<dyn crate::exec::ExecTaskStore> {
+        self.exec_task_store.clone()
+    }
+
+    /// Run 事实 + 结果正文 store（chat-flow W2 增量 5；只读查询
+    /// 工具与卡面结果行的读取口）。
+    pub fn exec_fact_store(&self) -> Arc<dyn crate::exec::ExecFactStore> {
+        self.exec_fact_store.clone()
+    }
+
+    /// 任务 Thread 输入的受理登记（进程内语义，重启清空——D2）。
+    pub fn exec_inbox(&self) -> &crate::exec::ExecInbox {
+        &self.exec_inbox
+    }
+
+    /// 执行调度器（chat-flow 增量 3）。
+    pub fn exec_scheduler(&self) -> Arc<crate::exec::ExecScheduler> {
+        Arc::clone(&self.exec_scheduler)
+    }
+
+    /// `[exec]` 运行控制配置（只读；增量 8 换代余量/sweep 周期
+    /// 的读取口）。
+    pub fn exec_config(&self) -> &crate::config::ExecConfig {
+        &self.exec_config
+    }
+
+    /// 执行事件订阅口（broadcast；事件是提示不是事实源——C7/增量
+    /// 4 通道侧刷新用）。
+    pub fn exec_events(&self) -> tokio::sync::broadcast::Receiver<crate::exec::ExecEvent> {
+        self.exec_scheduler.subscribe()
+    }
+
+    /// Sim 控制柄（chat-flow 增量 4，测试/本地驱动专用；P3 真实
+    /// adapter 替换后恒 None）。
+    pub fn exec_sim_control(&self) -> Option<crate::exec::SimControl> {
+        self.exec_sim_control.clone()
+    }
+
+    /// 执行任务的唯一创建契约（chat-flow N1/C2）：slash `/task` 与
+    /// 内建工具 `task_create` 两入口都经本方法，不各自直连 store。
+    /// 薄封装 `ExecTaskStore::create`：在此收口入口级校验——goal 非
+    /// 空（trim 后）；provider 的合法性由 `ExecProvider` 枚举在边界
+    /// 解析时保证（serde/FromStr 只收 kimi|codex），此处无字符串态
+    /// 可校验。返回 `(task, created)`：同 `channel_name + dedup_key`
+    /// 重送收敛到同一任务（`created=false`，既有行不变）。
+    pub async fn create_exec_task(
+        &self,
+        input: crate::exec::CreateExecTask,
+    ) -> Result<(crate::exec::ExecTask, bool)> {
+        if input.goal.trim().is_empty() {
+            return Err(KernelError::task(
+                "exec task goal must not be empty".to_string(),
+            ));
+        }
+        self.exec_task_store.create(&input).await
     }
 
     /// Get pinned session store
@@ -432,6 +509,7 @@ impl Kernel {
         models: Vec<crate::provider::ModelConfig>,
         tasks_config: crate::config::TasksConfig,
         gc_config: crate::config::GcConfig,
+        exec_config: crate::config::ExecConfig,
         update_session_title: bool,
         config_auto_approve: Level,
     ) -> Result<Arc<Self>> {
@@ -512,6 +590,7 @@ impl Kernel {
         )
         .with_cron(cron_store.clone(), Arc::clone(&cron_scheduler))
         .with_config_auto_approve(config_auto_approve)
+        .with_exec_task_store(Some(storage.exec_task_store()))
         .with_persist_pool(persist_pool);
 
         let agent_shared = match todo_interceptor {
@@ -552,7 +631,55 @@ impl Kernel {
             None
         };
 
-        Ok(Arc::new(Self {
+        // ── chat-flow 增量 3：执行调度器装配 ──────────────────
+        // 终态回调口（C4）：adapter 经 sink 上报终态，泵循环转
+        // `ExecScheduler::terminal`。
+        let (exec_sink, exec_sink_rx) = crate::exec::ExecAdapterSink::channel();
+        // 生产装配 = 挂起模式 SimAdapter（P3 由真实双 Provider
+        // adapter 替换）：不报完成、不报取消确认——无真实 Provider
+        // 时不伪造任何进展。
+        let exec_adapter = crate::exec::SimAdapter::default().with_sink(exec_sink);
+        // 增量 4：Sim 控制柄与 adapter 同 sink 装配（仅供测试与本
+        // 地驱动注入终态；P3 真实 adapter 替换后恒 None）。
+        let exec_sim_control = Some(exec_adapter.control());
+        let exec_adapter: Arc<dyn crate::exec::ExecAdapter> = Arc::new(exec_adapter);
+        let (exec_events_tx, _) = tokio::sync::broadcast::channel(256);
+        let exec_inbox = crate::exec::ExecInbox::new();
+        // 增量 5：调度器接 Run 事实 store（N7/N9）——Running 提交
+        // 与终态收口各写一条事实，结果上报先保存再公布。
+        let exec_scheduler = Arc::new(
+            crate::exec::ExecScheduler::new(
+                storage.exec_task_store(),
+                exec_adapter,
+                exec_inbox.clone(),
+                exec_events_tx,
+                exec_config.clone(),
+            )
+            .with_facts(storage.exec_fact_store()),
+        );
+        // 终态回调泵 + 停止确认周期清扫（随 shutdown 拆除）。
+        tokio::spawn(
+            exec_scheduler
+                .clone()
+                .terminal_pump(exec_sink_rx, shutdown.child_token()),
+        );
+        {
+            let sweep = Arc::clone(&exec_scheduler);
+            let token = shutdown.child_token();
+            let mut tick = tokio::time::interval(exec_scheduler.sweep_interval());
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => break,
+                        _ = tick.tick() => sweep.sweep_unconfirmed(),
+                    }
+                }
+            });
+        }
+
+        let kernel = Arc::new(Self {
             agent_shared,
             input_bus,
             conductor,
@@ -570,12 +697,22 @@ impl Kernel {
             restart_tx: Arc::new(std::sync::Mutex::new(None)),
             kv_cache: storage.kv_cache(),
             channel_manager,
+            exec_task_store: storage.exec_task_store(),
+            exec_fact_store: storage.exec_fact_store(),
+            exec_inbox,
+            exec_scheduler,
+            exec_config,
+            exec_sim_control,
             ext_routes: dashmap::DashMap::new(),
             notification_bus,
             shutdown,
             intake,
             started_at: Utc::now(),
-        }))
+        });
+        // 填 Kernel 回指 slot：`task_create` 工具经 AgentShared 升级
+        // 回本 Kernel 调 `create_exec_task`（N1 单一创建契约）。
+        kernel.agent_shared.set_kernel(&kernel);
+        Ok(kernel)
     }
 
     pub fn start(&self) {

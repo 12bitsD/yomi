@@ -98,6 +98,10 @@ pub struct ChannelHub {
     instances: Arc<DashMap<String, ChannelInstance>>,
     obs: Arc<ObsTracker>,
     ask: Arc<AskCardRegistry>,
+    /// 执行任务卡的 per-task 串行 PATCH 锁注册表（chat-flow 增量
+    /// 4，C9：同一卡任意时刻只有一个 PATCH 在飞；事件 relay 与回
+    /// 调/分流受理刷新共用）。
+    exec_patches: Arc<crate::channels::taskcard::relay::ExecCardPatches>,
 }
 
 impl ChannelHub {
@@ -107,6 +111,7 @@ impl ChannelHub {
             instances: Arc::new(DashMap::new()),
             obs: Arc::new(ObsTracker::new()),
             ask: Arc::new(AskCardRegistry::new()),
+            exec_patches: Arc::new(crate::channels::taskcard::relay::ExecCardPatches::default()),
         }
     }
 
@@ -194,6 +199,41 @@ impl ChannelHub {
             if let Some(bus) = coord.event_bus() {
                 self.start_event_forwarder(bus, shutdown.child_token(), kernel.clone())
                     .await;
+            }
+            // chat-flow 增量 4：exec 事件 → 任务卡刷新 relay（事件
+            // 只是提示，锁内重读快照渲染；仅当存在启用 exec_tasks
+            // 的通道实例——spawn 内自查，无则 warn 记录跳过）。
+            crate::channels::taskcard::relay::spawn_exec_relay(self, &coord);
+            // chat-flow 增量 8（§8-L1）：换代 sweep——relay 同进程
+            // 的低频清扫，活跃任务在更新期限前换代（空闲过期任务
+            // 留给分流臂「用户返回即换代」）。
+            crate::channels::taskcard::relay::spawn_renewal_sweep(self, &coord);
+            // chat-flow 增量 6（N11/D9）：重启后卡面如实——对每个
+            // 启用 exec_tasks 的通道实例，逐一刷新「本通道有卡的活
+            // 动任务」卡面一次（受理数归零、中断轮可见、旧队列不显
+            // 示仍可恢复）。刷新内部走同一「快照渲染 + 串行 PATCH」
+            // 路径；单个失败只 warn（呈现待同步，C9）。
+            let exec_channels: Vec<String> = self
+                .instances
+                .iter()
+                .filter(|i| i.config.exec_tasks)
+                .map(|i| i.key().clone())
+                .collect();
+            for channel in exec_channels {
+                match coord
+                    .exec_fact_store()
+                    .active_tasks_with_card(&channel)
+                    .await
+                {
+                    Ok(task_ids) => {
+                        for task_id in task_ids {
+                            self.refresh_exec_task_card(&coord, &task_id).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(channel = %channel, error = %e, "exec boot card refresh: task lookup failed");
+                    }
+                }
             }
         }
 
@@ -403,6 +443,18 @@ impl ChannelHub {
                                             return;
                                         };
                                         crate::channels::obs::handle_stop_action(&kernel, &action);
+                                    } else if ns.starts_with("exec_") {
+                                        // 执行任务主卡按钮（chat-flow
+                                        // 增量 4）：停止并暂停/恢复队
+                                        // 列——与 /stop 同档，不叠加
+                                        // admin；C9 重核在 handler 内。
+                                        let Some(kernel) = kernel_weak.upgrade() else {
+                                            return;
+                                        };
+                                        crate::channels::taskcard::handle_exec_action(
+                                            &name, &config, &kernel, &adapter, action,
+                                        )
+                                        .await;
                                     } else if ns.starts_with("bg_") {
                                         let Some(kernel) = kernel_weak.upgrade() else {
                                             return;
@@ -953,6 +1005,69 @@ impl ChannelHub {
         Ok(Some((routing, adapter)))
     }
 
+    /// 通道配置只读取口（`task_create` 工具的 `exec_tasks` 开关
+    /// 检查用，R7）。
+    pub(crate) fn channel_config(&self, name: &str) -> Option<ChannelConfig> {
+        self.instances.get(name).map(|i| i.config.clone())
+    }
+
+    /// 通道实例表句柄（增量 4：exec relay 按任务通道解析 adapter）。
+    pub(crate) fn instances_handle(&self) -> Arc<DashMap<String, ChannelInstance>> {
+        Arc::clone(&self.instances)
+    }
+
+    /// 任务卡串行 PATCH 锁注册表句柄（增量 4，relay 装配用）。
+    pub(crate) fn exec_patches(&self) -> Arc<crate::channels::taskcard::relay::ExecCardPatches> {
+        Arc::clone(&self.exec_patches)
+    }
+
+    /// 执行任务卡刷新（chat-flow 增量 4）：快照渲染 + per-task 串
+    /// 行 PATCH——按钮回调、分流受理与事件 relay 的唯一共用路径
+    /// （N7/C9）。
+    pub(crate) async fn refresh_exec_task_card(
+        &self,
+        kernel: &Arc<Kernel>,
+        task_id: &crate::types::ExecTaskId,
+    ) {
+        crate::channels::taskcard::relay::refresh_task_card(
+            kernel,
+            &self.instances,
+            &self.exec_patches,
+            task_id,
+        )
+        .await;
+    }
+
+    /// 空闲任务卡过期时的「用户返回即换代」（chat-flow 增量 8，
+    /// §8-L1）：分流臂受理前调用——决策为 `RenewOnReturn` 才换
+    /// （先换再受理）。换代只换呈现（D12）；换代失败
+    /// （`SendUncertain`）不阻断受理——受理是执行侧语义，呈现缺
+    /// 失由刷新路径如实反映（C9）。
+    pub(crate) async fn renew_exec_task_card_on_return(
+        &self,
+        kernel: &Arc<Kernel>,
+        task: &crate::exec::ExecTask,
+    ) {
+        let margin = std::time::Duration::from_secs(kernel.exec_config().card_renew_margin_secs);
+        let outcome = crate::channels::taskcard::renewal::renew_on_return_if_due(
+            kernel,
+            &self.instances,
+            &self.exec_patches,
+            task,
+            margin,
+            chrono::Utc::now(),
+        )
+        .await;
+        if let crate::channels::taskcard::renewal::RenewOutcome::SendUncertain { error } = &outcome
+        {
+            warn!(
+                task_id = %task.id,
+                error,
+                "exec card renewal on return uncertain; input acceptance proceeds (presentation stays stale)"
+            );
+        }
+    }
+
     /// Check whether a session is routed from an external channel, regardless
     /// of whether the channel instance is currently running.
     pub async fn is_channel_session(&self, session_id: &SessionId) -> bool {
@@ -1042,3 +1157,7 @@ fn build_adapter(
 #[cfg(test)]
 #[path = "hub_test.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "taskflow_test.rs"]
+mod taskflow_tests;

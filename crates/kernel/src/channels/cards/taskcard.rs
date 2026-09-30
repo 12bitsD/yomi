@@ -1,0 +1,785 @@
+//! 执行任务主卡（chat-flow 增量 4：增量 2 占位卡 → 快照驱动控制
+//! 卡）：任务身份的通道呈现、Thread 锚点与运行控制面——用户在本卡
+//! Thread 回复即向任务交办输入，经卡面按钮停止并暂停/恢复队列。
+//!
+//! 设计依据 docs/design/chat-flow-technical-design.md N2/C2/D2/C9/N7/R4：
+//! - N2/C2：卡即 Thread 锚（`thread_root_msg_id == card_msg_id`），
+//!   绑定三态如实呈现——「已登记·待初始化」（合法新任务，不伪造
+//!   Session 已存在）与「绑定损坏」（明确失败态）严格区分；
+//! - D2：受理队列是进程内事实，卡面必须标注「重启不保留」，不得
+//!   把旧输入显示为仍已排队；
+//! - N7/C9：卡面唯一渲染依据是任务登记 + lane 快照（事件只是提
+//!   示，快照是事实）；按钮 value 携带 `task`/`run`/`gen`，旧代
+//!   与失配回调在权威状态重核后一律不生效；
+//! - R4：业务失败不冒充任务成功——失败轮如实标「失败」。
+//!
+//! 增量 6 追加（N11/D9/C8/N10）：
+//! - 中断轮如实显示：重启后 lane 无 current，最近一轮若在启动核
+//!   对中被标 `interrupted`，卡面显示「已中断（进程重启）· 待核
+//!   对」——不凭旧 binding/running 显示一切正常；
+//! - 释放如实显示：运行实例空闲释放后卡面加「已释放」一行——
+//!   不删历史、不动队列/暂停，下次输入恢复原 Session。
+//!
+//! 增量 10 追加（N5/C5）：
+//! - 待回应区：`pending_request` 在时显示问题/授权摘要 + 每选项
+//!   一按钮（value 带 `task`/`run`/`req`/`gen`/`opt`，reject 类按
+//!   原生语义呈现不美化）；Submitted 显示「已提交，待确认」——
+//!   不显示「已生效」；无 Pending 不出该区；
+//! - `WaitingRequest` 状态行如实显示「等待回应」——等回答的
+//!   Run 仍占有 Session（在飞），停止按钮照常可用。
+//!
+//! 整卡 send/PATCH（schema 2.0，与 info 卡同信封风格）；CardKit
+//! 局部更新是 P5 的事。
+
+use serde_json::json;
+
+use crate::exec::{
+    BindingState, ExecOptionKind, ExecRequest, ExecRequestKind, ExecRequestStatus, ExecResultRow,
+    ExecRunRow, ExecTask, ExecTaskStatus, LaneSnapshot, RunStatus,
+};
+
+/// 主卡整卡 JSON（快照渲染）。`card_generation` 只进按钮 value
+/// （C9 旧代重核凭据），不参与卡面内容。`latest_result` 是任务最
+/// 新一份已保存的权威正文行（增量 5，N9）——存在时状态区下方
+/// 加结果行；完整结果区/附件入口/历史轮次是 P5，本增量只让
+/// 「已保存」可见。`latest_run` 是任务最近一轮 Run 事实（增量
+/// 6，N11）——仅当 lane 无 current（重启后）时用于中断轮显示。
+pub(crate) fn task_card(
+    task: &ExecTask,
+    snap: &LaneSnapshot,
+    card_generation: i64,
+    latest_result: Option<&ExecResultRow>,
+    latest_run: Option<&ExecRunRow>,
+) -> String {
+    let id_short = &task.id.as_str()[..12.min(task.id.as_str().len())];
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!(
+            "- **Task**: `{id_short}` · **Provider**: `{}`\n\
+             - **状态**: {}\n\
+             - **队列**: {}\n\
+             {}\
+             {}\
+             - **创建者**: `{}` · **创建**: {}",
+            task.provider,
+            status_line(task, snap, latest_run),
+            queue_line(snap),
+            result_line(latest_result),
+            release_line(snap),
+            task.created_by,
+            crate::storage::format_age(task.created_at),
+        ),
+    })];
+    let buttons = control_buttons(task, snap, card_generation);
+    // 增量 10（N5/C5）：待回应区插在状态区与控制区之间——有未结
+    // 请求才出区；Submitted 只标注「已提交，待确认」（不出按钮、
+    // 不显示「已生效」）。
+    if let Some(req) = &snap.pending_request {
+        elements.push(json!({ "tag": "hr" }));
+        elements.push(pending_block(req));
+        if req.status == ExecRequestStatus::Pending && !req.options.is_empty() {
+            let columns: Vec<serde_json::Value> = req
+                .options
+                .iter()
+                .map(|opt| {
+                    let kind = match opt.kind {
+                        ExecOptionKind::AllowOnce => "primary",
+                        // reject 类按原生语义呈现（danger），不美化。
+                        ExecOptionKind::RejectOnce => "danger",
+                        ExecOptionKind::AllowAlways | ExecOptionKind::Other => "default",
+                    };
+                    button_column(
+                        &opt.label,
+                        kind,
+                        &json!({
+                            "action": "exec_answer",
+                            "task": task.id.as_str(),
+                            "run": req.run_id.as_str(),
+                            "req": req.request_id.as_str(),
+                            "gen": card_generation,
+                            "opt": opt.option_id,
+                        }),
+                    )
+                })
+                .collect();
+            elements.push(json!({ "tag": "column_set", "columns": columns }));
+        }
+    }
+    if !buttons.is_empty() {
+        elements.push(json!({ "tag": "hr" }));
+        elements.push(json!({ "tag": "column_set", "columns": buttons }));
+    }
+    elements.push(json!({ "tag": "hr" }));
+    elements.push(json!({
+        "tag": "markdown",
+        "text_size": "notation",
+        "content": "在本卡 Thread 回复即向本任务交办；按钮操作按最新登记状态核对，过期操作不生效。",
+    }));
+    json!({
+        "schema": "2.0",
+        "header": {
+            "template": "turquoise",
+            "title": { "tag": "plain_text", "content": format!("🧩 任务卡 · {}", goal_excerpt(&task.goal)) },
+        },
+        "body": { "elements": elements },
+    })
+    .to_string()
+}
+
+/// 状态区一行（如实映射增量 3 lane 语义 + 增量 6 中断轮）。
+fn status_line(task: &ExecTask, snap: &LaneSnapshot, latest_run: Option<&ExecRunRow>) -> String {
+    if task.status == ExecTaskStatus::Archived {
+        return "⏹ 任务已归档".to_string();
+    }
+    // blocked_unknown 与 Run Unknown 同义呈现：派发/终态确认丢失
+    // ——如实阻断后续派发，不猜不跳（N3）。
+    if snap.blocked_unknown {
+        return "⚠️ 状态待核对（已阻断后续派发）".to_string();
+    }
+    match snap.current.as_ref() {
+        Some(run) => {
+            let seq = run.input_seq;
+            match run.status {
+                // Starting：尚无 Provider 开始证据，不显示已开始（C9）。
+                RunStatus::Starting => format!("启动中 · 第 {seq} 轮（开始未确认）"),
+                RunStatus::Running => format!(
+                    "执行中 · 第 {seq} 轮（{}）",
+                    crate::storage::format_age(run.started_at)
+                ),
+                // 等回答仍占有 Session（C5：在飞，不能开始下一轮）。
+                RunStatus::WaitingRequest => {
+                    format!("等待回应 · 第 {seq} 轮（回答后继续，未开始新一轮）")
+                }
+                // 停止中 ≠ 已停止（C6）：未确认前不启动后续。
+                RunStatus::Stopping => format!("停止中 · 第 {seq} 轮（未确认前不启动后续）"),
+                RunStatus::Stopped => format!("已停止 · 第 {seq} 轮"),
+                RunStatus::Completed => format!("第 {seq} 轮已结束（完成）"),
+                // R4：业务失败不冒充任务成功。
+                RunStatus::Failed => format!("第 {seq} 轮已结束（失败）"),
+                RunStatus::Unknown => "⚠️ 状态待核对（已阻断后续派发）".to_string(),
+            }
+        }
+        // 无 current（重启后 lane 为空）：最近一轮若在启动核对中
+        // 被标 interrupted，如实显示中断（N11/D9）——不凭旧
+        // binding 显示一切正常，也不显示旧队列仍可恢复。
+        None => match latest_run {
+            Some(r) if r.status == "interrupted" => {
+                format!("⚠️ 第 {} 轮已中断（进程重启）· 待核对", r.input_seq)
+            }
+            // 绑定三态（增量 2 文案）——「待初始化」不是损坏，损
+            // 坏是明确失败态（N2）。
+            _ => match task.binding {
+                BindingState::Uninitialized => "已登记 · 待初始化".to_string(),
+                BindingState::Bound => "已绑定".to_string(),
+                BindingState::Broken => "⚠️ 绑定损坏".to_string(),
+            },
+        },
+    }
+}
+
+/// 结果区一行（增量 5，N9）：有已保存正文时如实显示「已保存 +
+/// 轮次 + 字节数」；正文不入卡（完整结果区/附件入口是 P5）。无
+/// 结果时为空串（不占行）。
+fn result_line(latest: Option<&ExecResultRow>) -> String {
+    latest.map_or_else(String::new, |r| {
+        format!(
+            "- **结果**: 📄 第 {} 轮结果已保存（{} 字节）\n",
+            r.input_seq, r.body_bytes
+        )
+    })
+}
+
+/// 释放区一行（增量 6，C8/N10）：运行实例空闲释放后如实显示
+/// 「已释放 + 恢复原 Session」——有 current 终态且 released 时；
+/// 释放不删历史、不动队列/暂停。在飞 Run 或新 Run 起跑后不占行。
+fn release_line(snap: &LaneSnapshot) -> String {
+    let show = snap.released && snap.current.as_ref().is_some_and(|r| !r.status.is_live());
+    if show {
+        "- **实例**: 运行实例已释放（下次输入恢复原 Session）\n".to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 队列区一行（D2 标签保留：进程内受理，重启不保留）。
+fn queue_line(snap: &LaneSnapshot) -> String {
+    let paused = if snap.queued > 0 && snap.paused {
+        "已暂停 · "
+    } else {
+        ""
+    };
+    format!(
+        "已受理待执行 {} 条（{paused}进程内 · 重启不保留）",
+        snap.queued
+    )
+}
+
+/// 待回应区摘要块（增量 10，N5/C5）：问题/授权摘要（原生原文摘
+/// 录，不改写语义）；Submitted 标注「已提交，待确认」——不显示
+/// 「已生效」（已提交≠已接收）。
+fn pending_block(req: &ExecRequest) -> serde_json::Value {
+    let kind_label = match req.kind {
+        ExecRequestKind::Permission => "授权请求",
+        ExecRequestKind::Question => "提问",
+    };
+    let suffix = if req.status == ExecRequestStatus::Submitted {
+        "（已提交，待确认）"
+    } else {
+        ""
+    };
+    json!({
+        "tag": "markdown",
+        "content": format!(
+            "- **待回应**: {kind_label}：{}{suffix}",
+            excerpt(&req.prompt_text, 60),
+        ),
+    })
+}
+
+/// 摘要摘录：换行压平、前 `max` 字截断（原生原文可能很长/多行）。
+fn excerpt(text: &str, max: usize) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = flat.chars().take(max).collect();
+    if flat.chars().count() > max {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+/// 控制区按钮列（`column_set` 的 columns；无可合法操作时为空——
+/// Stopping / 状态待核对 / 已归档一律不出按钮）。
+fn control_buttons(task: &ExecTask, snap: &LaneSnapshot, gen: i64) -> Vec<serde_json::Value> {
+    if task.status == ExecTaskStatus::Archived
+        || snap.blocked_unknown
+        || snap
+            .current
+            .as_ref()
+            .is_some_and(|r| r.status == RunStatus::Stopping)
+    {
+        return Vec::new();
+    }
+    let mut columns = Vec::new();
+    // Running / WaitingRequest → ⏹ 停止并暂停（value 锁定当前
+    // run——旧按钮套不到新 Run，C6/R7；等回答的 Run 仍在飞，停
+    // 止照常可用，C5）。
+    if let Some(run) = snap
+        .current
+        .as_ref()
+        .filter(|r| matches!(r.status, RunStatus::Running | RunStatus::WaitingRequest))
+    {
+        columns.push(button_column(
+            "⏹ 停止并暂停",
+            "danger",
+            &json!({
+                "action": "exec_stop",
+                "task": task.id.as_str(),
+                "run": run.run_id.as_str(),
+                "gen": gen,
+            }),
+        ));
+    }
+    // paused（无论有无 current）→ ▶ 恢复队列。
+    if snap.paused {
+        columns.push(button_column(
+            "▶ 恢复队列",
+            "primary",
+            &json!({
+                "action": "exec_resume",
+                "task": task.id.as_str(),
+                "run": null,
+                "gen": gen,
+            }),
+        ));
+    }
+    columns
+}
+
+/// 单个按钮列（与 obs/approval 卡同一 button 形态）。
+fn button_column(text: &str, kind: &str, value: &serde_json::Value) -> serde_json::Value {
+    json!({
+        "tag": "column", "width": "auto",
+        "elements": [{
+            "tag": "button",
+            "size": "small",
+            "text": { "tag": "plain_text", "content": text },
+            "type": kind,
+            "behaviors": [{ "type": "callback", "value": value }],
+        }],
+    })
+}
+
+/// 卡标题里的 goal 摘录：前 30 字，换行压平（标题是单行
+/// `plain_text`，用户原文可能带换行）。
+fn goal_excerpt(goal: &str) -> String {
+    let flat: String = goal.split_whitespace().collect::<Vec<_>>().join(" ");
+    let truncated: String = flat.chars().take(30).collect();
+    if flat.chars().count() > 30 {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::exec::{ExecProvider, ExecTaskSource, RunRecord};
+    use crate::types::{ExecTaskId, RunId};
+    use chrono::Utc;
+
+    fn task(binding: BindingState) -> ExecTask {
+        ExecTask {
+            id: ExecTaskId::new(),
+            channel_name: "feishu".into(),
+            provider: ExecProvider::Kimi,
+            status: ExecTaskStatus::Active,
+            binding,
+            provider_session_id: None,
+            thread_root_msg_id: None,
+            card_msg_id: None,
+            card_generation: 0,
+            card_sent_at: None,
+            card_entity_created_at: None,
+            goal: "把登錄頁的校驗邏輯抽出來獨立成模塊，跑通全量測試，再補一條用例覆蓋空輸入與超時"
+                .into(),
+            working_dir: None,
+            created_by: "ou_user".into(),
+            source: ExecTaskSource::Entry,
+            dedup_key: "k1".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn run(seq: u64, status: RunStatus) -> RunRecord {
+        RunRecord {
+            run_id: RunId::new(),
+            task_id: ExecTaskId::new(),
+            input_seq: seq,
+            text: "输入原文".into(),
+            image_keys: vec![],
+            status,
+            started_at: Utc::now(),
+            ended_at: None,
+        }
+    }
+
+    fn snap(
+        current: Option<RunRecord>,
+        queued: usize,
+        paused: bool,
+        blocked_unknown: bool,
+    ) -> LaneSnapshot {
+        LaneSnapshot {
+            paused,
+            current,
+            queued,
+            blocked_unknown,
+            released: false,
+            pending_request: None,
+        }
+    }
+
+    /// 无结果行/无 Run 事实的渲染捷径（既有增量 4 场景与结果区、
+    /// 中断轮无关）。
+    fn render(task: &ExecTask, snap: &LaneSnapshot, gen: i64) -> String {
+        task_card(task, snap, gen, None, None)
+    }
+
+    /// 卡面全部按钮的 callback value（解析整卡 JSON）。
+    fn button_values(card: &str) -> Vec<serde_json::Value> {
+        let parsed: serde_json::Value = serde_json::from_str(card).unwrap();
+        let mut values = Vec::new();
+        for el in parsed["body"]["elements"].as_array().unwrap() {
+            if el["tag"] == "column_set" {
+                for col in el["columns"].as_array().unwrap() {
+                    values.push(col["elements"][0]["behaviors"][0]["value"].clone());
+                }
+            }
+        }
+        values
+    }
+
+    // ── 增量 4 场景 6：渲染单测（各形态文案与按钮有无）──────────
+
+    #[test]
+    fn idle_card_renders_binding_states_and_queue_honestly() {
+        // 三态文案严格区分（N2：待初始化 ≠ 损坏 ≠ 已绑定）。
+        let idle = snap(None, 0, false, false);
+        let uninit = render(&task(BindingState::Uninitialized), &idle, 0);
+        assert!(uninit.contains("已登记 · 待初始化"), "{uninit}");
+        assert!(!uninit.contains("绑定损坏"), "{uninit}");
+        let broken = render(&task(BindingState::Broken), &idle, 0);
+        assert!(broken.contains("绑定损坏"), "{broken}");
+        let bound = render(&task(BindingState::Bound), &idle, 0);
+        assert!(bound.contains("已绑定"), "{bound}");
+
+        // 队列区如实标注进程内语义（D2：重启不保留）。
+        let card = render(
+            &task(BindingState::Uninitialized),
+            &snap(None, 3, false, false),
+            0,
+        );
+        assert!(card.contains("已受理待执行 3 条"), "{card}");
+        assert!(card.contains("进程内 · 重启不保留"), "{card}");
+        // 未暂停不标注「已暂停」。
+        assert!(!card.contains("已暂停"), "{card}");
+
+        // 空队列 + 无 current + 未暂停：无可合法操作，无按钮回调。
+        assert!(button_values(&uninit).is_empty(), "{uninit}");
+
+        // 结构：turquoise 头、goal 摘录（30 字截断）、合法 JSON 整卡。
+        assert!(card.contains("\"template\":\"turquoise\""), "{card}");
+        assert!(card.contains("🧩 任务卡 · "), "{card}");
+        assert!(card.contains("…"), "{card}");
+        let parsed: serde_json::Value = serde_json::from_str(&card).unwrap();
+        assert_eq!(parsed["schema"], "2.0");
+    }
+
+    #[test]
+    fn running_card_shows_stop_button_with_full_value() {
+        let t = task(BindingState::Bound);
+        let r = run(3, RunStatus::Running);
+        let run_id = r.run_id.as_str().to_string();
+        let card = render(&t, &snap(Some(r), 1, false, false), 7);
+        assert!(card.contains("执行中 · 第 3 轮"), "{card}");
+        // 未暂停：只有 ⏹，value 含 task/run/gen 三字段（C9 重核凭据）。
+        let values = button_values(&card);
+        assert_eq!(values.len(), 1, "{card}");
+        assert_eq!(
+            values[0],
+            serde_json::json!({
+                "action": "exec_stop",
+                "task": t.id.as_str(),
+                "run": run_id,
+                "gen": 7,
+            })
+        );
+    }
+
+    #[test]
+    fn stopping_card_blocks_all_buttons() {
+        let card = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Stopping)), 1, true, false),
+            0,
+        );
+        assert!(card.contains("停止中 · 第 2 轮"), "{card}");
+        assert!(card.contains("未确认前不启动后续"), "{card}");
+        assert!(button_values(&card).is_empty(), "Stopping 不出任何按钮");
+    }
+
+    #[test]
+    fn terminal_cards_report_truthfully() {
+        let stopped = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(4, RunStatus::Stopped)), 0, true, false),
+            0,
+        );
+        assert!(stopped.contains("已停止 · 第 4 轮"), "{stopped}");
+        let completed = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(4, RunStatus::Completed)), 0, false, false),
+            0,
+        );
+        assert!(completed.contains("第 4 轮已结束（完成）"), "{completed}");
+        let failed = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(4, RunStatus::Failed)), 0, false, false),
+            0,
+        );
+        // R4：业务失败不冒充任务成功。
+        assert!(failed.contains("第 4 轮已结束（失败）"), "{failed}");
+        assert!(!failed.contains("（完成）"), "{failed}");
+    }
+
+    #[test]
+    fn unknown_card_marks_recheck_and_blocks_buttons() {
+        let card = render(&task(BindingState::Bound), &snap(None, 2, false, true), 0);
+        assert!(card.contains("⚠️ 状态待核对（已阻断后续派发）"), "{card}");
+        assert!(button_values(&card).is_empty(), "blocked 不出按钮");
+    }
+
+    #[test]
+    fn paused_card_marks_queue_and_offers_resume() {
+        // queued>0 + paused → 队列标注「已暂停」+ ▶（run 为 null）。
+        let card = render(&task(BindingState::Bound), &snap(None, 2, true, false), 5);
+        assert!(card.contains("已暂停 · 进程内 · 重启不保留"), "{card}");
+        let values = button_values(&card);
+        assert_eq!(values.len(), 1, "{card}");
+        assert_eq!(
+            values[0],
+            serde_json::json!({
+                "action": "exec_resume",
+                "task": values[0]["task"].clone(),
+                "run": null,
+                "gen": 5,
+            })
+        );
+        assert!(!values[0]["task"].as_str().unwrap().is_empty());
+        // 空队列 + paused：不标注「已暂停」，▶ 仍在（无论有无 current）。
+        let empty = render(&task(BindingState::Bound), &snap(None, 0, true, false), 5);
+        assert!(!empty.contains("已暂停"), "{empty}");
+        assert_eq!(button_values(&empty).len(), 1, "{empty}");
+    }
+
+    #[test]
+    fn archived_card_shows_no_buttons() {
+        let mut t = task(BindingState::Bound);
+        t.status = ExecTaskStatus::Archived;
+        let card = render(
+            &t,
+            &snap(Some(run(1, RunStatus::Running)), 1, true, false),
+            0,
+        );
+        assert!(card.contains("任务已归档"), "{card}");
+        assert!(button_values(&card).is_empty(), "archived 不出按钮");
+    }
+
+    #[test]
+    fn goal_excerpt_flattens_and_truncates() {
+        assert_eq!(goal_excerpt("短目标"), "短目标");
+        assert_eq!(goal_excerpt("  多行\n目标\t带空白  "), "多行 目标 带空白");
+        let long = "一".repeat(40);
+        let excerpt = goal_excerpt(&long);
+        assert_eq!(excerpt.chars().count(), 31, "30 字 + 省略号");
+        assert!(excerpt.ends_with('…'));
+    }
+
+    // ── 增量 10：待回应区（N5/C5）─────────────────────────────
+
+    use crate::exec::{ExecOptionKind, ExecRequest, ExecRequestKind, ExecRequestStatus};
+    use crate::types::ExecRequestId;
+
+    fn request(status: ExecRequestStatus) -> ExecRequest {
+        ExecRequest {
+            request_id: ExecRequestId::new(),
+            task_id: ExecTaskId::new(),
+            run_id: RunId::new(),
+            native_ref: "1".into(),
+            kind: ExecRequestKind::Permission,
+            prompt_text: "Bash: Requesting approval to Running:\n echo hi 且换行压平".into(),
+            options: vec![
+                crate::exec::ExecRequestOption {
+                    option_id: "approve_once".into(),
+                    label: "Approve once".into(),
+                    kind: ExecOptionKind::AllowOnce,
+                },
+                crate::exec::ExecRequestOption {
+                    option_id: "reject".into(),
+                    label: "Reject".into(),
+                    kind: ExecOptionKind::RejectOnce,
+                },
+            ],
+            status,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// 带待回应请求的快照（请求的 run_id 与 current 对齐——快照
+    /// 语义是「当前 Run 的未结请求」）。
+    fn snap_with_request(status: ExecRequestStatus) -> (LaneSnapshot, ExecRequest) {
+        let mut req = request(status);
+        let r = run(3, RunStatus::WaitingRequest);
+        req.run_id = r.run_id.clone();
+        req.task_id = r.task_id.clone();
+        let mut s = snap(Some(r), 0, false, false);
+        s.pending_request = Some(req.clone());
+        (s, req)
+    }
+
+    #[test]
+    fn pending_request_renders_area_with_option_buttons() {
+        let t = task(BindingState::Bound);
+        let (s, req) = snap_with_request(ExecRequestStatus::Pending);
+        let card = render(&t, &s, 7);
+        // 状态行：等待回应（在飞，未开始新一轮）。
+        assert!(card.contains("等待回应 · 第 3 轮"), "{card}");
+        // 待回应区：种类 + 摘要（换行压平）。
+        assert!(card.contains("**待回应**: 授权请求："), "{card}");
+        assert!(card.contains("echo hi 且换行压平"), "{card}");
+        // 每选项一按钮，value 带 task/run/req/gen/opt 全字段。
+        let values = button_values(&card);
+        let answers: Vec<_> = values
+            .iter()
+            .filter(|v| v["action"] == "exec_answer")
+            .collect();
+        assert_eq!(answers.len(), 2, "{card}");
+        assert_eq!(
+            answers[0],
+            &serde_json::json!({
+                "action": "exec_answer",
+                "task": t.id.as_str(),
+                "run": req.run_id.as_str(),
+                "req": req.request_id.as_str(),
+                "gen": 7,
+                "opt": "approve_once",
+            })
+        );
+        assert_eq!(answers[1]["opt"], "reject");
+        // reject 按原生语义呈现：原生文案直出，不美化。
+        assert!(card.contains("Reject"), "{card}");
+        // WaitingRequest 仍在飞：⏹ 停止按钮照常（C5 占有 Session）。
+        assert!(
+            values.iter().any(|v| v["action"] == "exec_stop"),
+            "等回答的 Run 停止照常可用: {card}"
+        );
+    }
+
+    #[test]
+    fn submitted_request_shows_submitted_not_effective() {
+        let (s, _req) = snap_with_request(ExecRequestStatus::Submitted);
+        let card = render(&task(BindingState::Bound), &s, 0);
+        // 已提交≠已接收：显示「已提交，待确认」，不显示「已生效」。
+        assert!(card.contains("已提交，待确认"), "{card}");
+        assert!(!card.contains("已生效"), "{card}");
+        // Submitted 不再出回答按钮（重复不重复放行）。
+        let values = button_values(&card);
+        assert!(
+            !values.iter().any(|v| v["action"] == "exec_answer"),
+            "Submitted 不出回答按钮: {card}"
+        );
+    }
+
+    #[test]
+    fn no_pending_request_no_area() {
+        let card = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(3, RunStatus::Running)), 0, false, false),
+            0,
+        );
+        assert!(!card.contains("待回应"), "{card}");
+        assert!(
+            !button_values(&card)
+                .iter()
+                .any(|v| v["action"] == "exec_answer"),
+            "{card}"
+        );
+    }
+
+    // ── 增量 5：结果行（N9：只让「已保存」可见，正文不入卡）─────
+
+    #[test]
+    fn result_line_shows_saved_marker_and_hides_body() {
+        let row = ExecResultRow {
+            run_id: RunId::new(),
+            task_id: ExecTaskId::new(),
+            input_seq: 2,
+            body: "正文不应出现在卡面".into(),
+            body_bytes: 1234,
+            meta: serde_json::json!({}),
+            created_at: Utc::now(),
+        };
+        let card = task_card(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
+            0,
+            Some(&row),
+            None,
+        );
+        assert!(card.contains("第 2 轮结果已保存（1234 字节）"), "{card}");
+        assert!(card.contains("📄"), "{card}");
+        assert!(
+            !card.contains("正文不应出现在卡面"),
+            "结果行只显示已保存标记，不带正文"
+        );
+        // 无结果：不占行（既有形态不变）。
+        let plain = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
+            0,
+        );
+        assert!(!plain.contains("结果已保存"), "{plain}");
+        assert!(!plain.contains("**结果**"), "{plain}");
+    }
+
+    // ── 增量 6：中断轮与释放行（N11/D9/C8/N10）──────────────────
+
+    fn run_row(seq: u64, status: &str) -> ExecRunRow {
+        ExecRunRow {
+            run_id: RunId::new(),
+            task_id: ExecTaskId::new(),
+            input_seq: seq,
+            status: status.to_string(),
+            text: "输入原文".into(),
+            image_keys: vec![],
+            terminal_kind: None,
+            started_at: Utc::now(),
+            ended_at: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn interrupted_latest_run_shows_recheck_instead_of_binding() {
+        // 重启后 lane 无 current：最近一轮被启动核对标 interrupted
+        // → 「已中断 · 待核对」，不凭旧 binding 显示「已绑定」（N11/
+        // D9：不凭旧 running 显示正常）。
+        let interrupted = run_row(3, "interrupted");
+        let card = task_card(
+            &task(BindingState::Bound),
+            &snap(None, 0, false, false),
+            0,
+            None,
+            Some(&interrupted),
+        );
+        assert!(
+            card.contains("⚠️ 第 3 轮已中断（进程重启）· 待核对"),
+            "{card}"
+        );
+        assert!(!card.contains("已绑定"), "{card}");
+        // 队列如实归零且不显示仍可恢复（受理是进程内语义，D2）。
+        assert!(card.contains("已受理待执行 0 条"), "{card}");
+
+        // lane 有 current 时以 lane 为准（事实行不越位）。
+        let running = task_card(
+            &task(BindingState::Bound),
+            &snap(Some(run(4, RunStatus::Running)), 0, false, false),
+            0,
+            None,
+            Some(&interrupted),
+        );
+        assert!(running.contains("执行中 · 第 4 轮"), "{running}");
+        assert!(!running.contains("已中断"), "{running}");
+
+        // 最近一轮正常终态（completed）：回到绑定三态，无中断文案。
+        let completed = run_row(3, "completed");
+        let card = task_card(
+            &task(BindingState::Bound),
+            &snap(None, 0, false, false),
+            0,
+            None,
+            Some(&completed),
+        );
+        assert!(card.contains("已绑定"), "{card}");
+        assert!(!card.contains("已中断"), "{card}");
+    }
+
+    #[test]
+    fn released_line_shows_only_with_terminal_current_and_released() {
+        // current 终态 + released → 「已释放」行（C8/N10：不删历
+        // 史，下次输入恢复原 Session）。
+        let mut s = snap(Some(run(2, RunStatus::Completed)), 0, false, false);
+        s.released = true;
+        let card = render(&task(BindingState::Bound), &s, 0);
+        assert!(
+            card.contains("运行实例已释放（下次输入恢复原 Session）"),
+            "{card}"
+        );
+
+        // released 但 current 在飞 → 不占行（在飞 Run 拥有会话）。
+        let mut s = snap(Some(run(2, RunStatus::Running)), 0, false, false);
+        s.released = true;
+        let card = render(&task(BindingState::Bound), &s, 0);
+        assert!(!card.contains("已释放"), "{card}");
+
+        // 未释放 → 不占行。
+        let card = render(
+            &task(BindingState::Bound),
+            &snap(Some(run(2, RunStatus::Completed)), 0, false, false),
+            0,
+        );
+        assert!(!card.contains("已释放"), "{card}");
+    }
+}

@@ -120,6 +120,19 @@ KIMI_AGENT_API_KEY = "sk-..."
 
 ---
 
+## `[exec]` — 执行任务运行控制
+
+| 字段 | 类型 | 说明 | 默认值 |
+|---|---|---|---|
+| `max_concurrent_runs` | integer | 全局并发 Run 名额（按卡隔离、统一分配；min 1） | `2` |
+| `stop_confirm_timeout_secs` | integer | 停止确认超时（秒）：超时未报原生终态 → 标记 `StopUnconfirmed` 并保留 Stopping | `30` |
+| `card_renew_margin_secs` | integer | 主卡换代余量（秒）：活跃/待回答任务在最早适用更新期限（消息 14 天 / CardKit 实体 14 天，取较早者）前留出本余量即换代 | `129600`（36h） |
+| `card_renew_sweep_secs` | integer | 主卡换代 sweep 周期（秒）：hub relay 同进程的低频清扫，对活动任务跑换代决策并执行临期换代 | `1800`（30min） |
+
+执行任务功能按通道启用（`[[channels]]` 的 `exec_tasks`，默认 `false`）。
+
+---
+
 ## `[env]` — 环境变量注入
 
 启动时注入进程环境（键名按原样写入，**覆盖**主机同名变量）：
@@ -180,6 +193,7 @@ app_secret = "..."
 | `history_context` | 触发时注入的最近聊天记录条数（0 关闭） | `20` |
 | `admin_users` | 管理员 `open_id` 列表（`/restart`、`/permits` 等命令与审批按钮鉴权） | `[]` |
 | `approval_chat_id` | 飞书云文档权限申请的通知群；未配置则私聊 `admin_users` | — |
+| `exec_tasks` | 执行任务功能开关：`/task` 入口、任务 Thread 分流与 `task_create` 工具（关闭时 `/task` 明确拒绝、分流落回原 chat 路径） | `false` |
 | `disabled_events` | 运行时停用的平台事件（飞书支持 `doc_comment`） | `[]` |
 
 运行期命令：`/thread <文本>` 一次性开话题回复；`/threads on|off|reset` 按群覆盖 `reply_in_thread`（admin）。
